@@ -1,0 +1,42 @@
+# tdu2 - ReXGlue recompiled project
+#
+# ReXGlue cvar config, read at startup from next to the exe. FLAT key = value -
+# there are no [sections]. (Verified the hard way: a sectioned file loads
+# without complaint but silently applies nothing, which is an easy trap.)
+#
+# Precedence: this file < REX_* environment variables < command line.
+#
+# CMake copies this template to <build>/tdu2.toml on configure, and only when
+# no tdu2.toml is already there - so your edits survive a rebuild.
+
+# Window size in logical pixels.
+window_width = 1600
+window_height = 900
+fullscreen = false
+
+# Guest video mode - what the 360 game believes it is rendering at, and what
+# XGetVideoMode reports back to it. This is NOT the window size; it is the
+# internal render target.
+#
+# --resolution is a shorthand that sets both at once (720p / 1080p / 1440p / 4k).
+# Setting these explicitly lets you render at one resolution and present in a
+# differently sized window (the host scales).
+video_mode_width = 1280
+video_mode_height = 720
+video_mode_refresh_rate = 60
+
+# trace shows the recompiled-function call stream (very noisy); debug is a good
+# middle ground; info is normal play.
+log_level = "info"
+
+# --- Synthetic dashboard profile -------------------------------------------
+#
+# ReXGlue emulates no dashboard and no user accounts, so there is no signed-in
+# profile for the game to read. These cvars give it a stable local identity,
+# persisted back to this file when you change them in the F1 menu.
+#
+# This is NOT an Xbox Live account and does not authenticate to any server.
+# See README "Profile and online status" for what this does and does not cover.
+profile_name = "ReXGlue Player"
+profile_xuid = 2533274793222573
+profile_signed_in = true

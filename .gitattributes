@@ -1,0 +1,19 @@
+# Normalise text in the repository; check out platform-native endings.
+#
+# build.cmd is the exception: it is a Windows batch file, and cmd.exe misparses
+# LF-only line endings (labels and `goto` silently break). Force CRLF for it
+# regardless of platform so the script always runs on Windows.
+* text=auto
+build.cmd text eol=crlf
+
+*.cpp text
+*.h   text
+*.py  text
+*.md  text
+*.toml text
+*.json text
+*.txt text
+
+# Never rewrite these as text.
+*.png binary
+*.jpg binary

@@ -1,0 +1,29 @@
+# ReXGlue codegen output - regenerated on every build from the manifest.
+generated/
+
+# Build trees
+out/
+build/
+
+# Logs written next to the built exe
+logs/
+
+# Local scratch
+*.log
+codegen.build.stamp
+
+# --- Never commit these -------------------------------------------------------
+#
+# Game content from the retail release. ~6.6 GB, of which bigfile1.big and
+# bigfile2.big are 3.0 GB and 3.4 GB single files. Two independent reasons:
+#   * GitHub hard-fails any blob over 100 MB, so a commit containing these
+#     would be rejected outright.
+#   * This is copyrighted commercial game data. It has no business in a
+#     public repository and cannot be redistributed.
+# Point --game_data_root at your own copy instead; the path is never hardcoded.
+TDU2/
+
+# The ReXGlue SDK is a separate, third-party project with its own releases
+# (~199 MB of prebuilt headers/libs/toolchain). Fetch it per build.cmd rather
+# than vendoring it into this repository.
+rexglue/
