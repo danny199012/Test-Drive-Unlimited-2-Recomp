@@ -261,6 +261,7 @@ and it has now yielded three crashes in a row from three different screens:
 | `0x88313820` | Map, further in |
 | `0x88B88420` | Map, closing |
 | `0x88E88220` | Driving |
+| `0x882F06E8` | Real Estate |
 
 **Crashes that look random usually are not.** The driving crash looked
 intermittent, but two consecutive runs died at exactly `0x88E88220` — a specific
@@ -271,6 +272,10 @@ address repeats across logs before assuming it is a moving target:
 python tools\check_func.py --latest
 Select-String -Path out\build\win-amd64-perf\logs\*.log -Pattern FATAL
 ```
+
+All six are the same root cause: a virtual call the game makes through a vtable,
+compiled to a prologueless thunk. Pinning one often exposes the neighbouring slot
+in the same table next.
 
 Each pin exposes the next slot, so opening a new screen commonly surfaces a
 fresh one. Two practical consequences:
@@ -338,11 +343,14 @@ exe via `rexglue_setup_target(tdu2 GPU_PLUGINS xenos)`.
 - [x] **A full 420 s run with no `[FATAL]`** — all known scanner gaps closed
 - [x] **Reaches gameplay and renders a real 3D scene** — world geometry, textured
       models, and on-screen text (confirmed by screenshot)
+- [x] **Playable end to end for a 35 minute session** — licence acquired,
+      tournament won, clothing purchased, driving, map and pause menu all working
 - [x] F1 quick-settings menu and F4 cvar editor both work
 - [x] Synthetic profile installed over the guest's `XamUser*` imports
 - [ ] Character/visual artefacts reported in-game — not yet captured or diagnosed
-- [ ] **More UI crashes expected** — pause menu and map are fixed; each new
-      screen reached tends to expose the next thunk in the 0x882EFExx cluster
+- [ ] **More UI crashes expected** — six fixed so far (pause, map open, map
+      further, map close, driving, real estate); each new screen reached tends to
+      expose the next thunk in the same vtable
 - [ ] Online / Xbox Live functionality (see *Profile and online status*)
 
 Run length before hitting the next unregistered function went

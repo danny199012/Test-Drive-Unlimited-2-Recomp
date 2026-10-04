@@ -222,3 +222,12 @@ name = "sub_88B88420"
 # and pinning on a guess is how a missing thunk turns into a bad jump elsewhere.
 [modules.functions."0x88E88220"]
 name = "sub_88E88220"
+
+# Reached entering Real Estate from the map, after a 35 minute session (licence,
+# tournament win, clothing purchase all worked). 0x30-byte unregistered run
+# between 0x882F06D0 and 0x882F0700; both neighbours are vtable-slot dispatch
+# thunks (lwz vtable; lwz slot 168/176; mtctr; bctr), so this is a virtual call
+# table. Same root cause as every other pin so far - a prologueless thunk with
+# no stack frame for the scanner to anchor on.
+[modules.functions."0x882F06E8"]
+name = "sub_882F06E8"
