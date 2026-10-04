@@ -231,3 +231,12 @@ name = "sub_88E88220"
 # no stack frame for the scanner to anchor on.
 [modules.functions."0x882F06E8"]
 name = "sub_882F06E8"
+
+# Reached when police AI escalates to a chase: ramming a police car a second
+# time makes them pursue you, and the chase path calls an unregistered
+# function. Deterministic repro (ram a cop, let them chase), which makes this
+# one easy to verify after rebuilding. 0x68-byte unregistered run between two
+# real functions, so this is not a vtable slot table like the earlier pins -
+# it is a plain missing body.
+[modules.functions."0x881E9FE0"]
+name = "sub_881E9FE0"
