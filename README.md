@@ -257,8 +257,20 @@ and it has now yielded three crashes in a row from three different screens:
 | Address | Reached by |
 |---|---|
 | `0x882EFED0` | Pause menu |
-| `0x882EFED8` | Map (Select button) |
+| `0x882EFED8` | Map, opening |
 | `0x88313820` | Map, further in |
+| `0x88B88420` | Map, closing |
+| `0x88E88220` | Driving |
+
+**Crashes that look random usually are not.** The driving crash looked
+intermittent, but two consecutive runs died at exactly `0x88E88220` — a specific
+code path, not thread-timing noise. When a crash seems random, check whether the
+address repeats across logs before assuming it is a moving target:
+
+```
+python tools\check_func.py --latest
+Select-String -Path out\build\win-amd64-perf\logs\*.log -Pattern FATAL
+```
 
 Each pin exposes the next slot, so opening a new screen commonly surfaces a
 fresh one. Two practical consequences:

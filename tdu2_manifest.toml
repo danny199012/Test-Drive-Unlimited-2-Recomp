@@ -213,3 +213,12 @@ name = "sub_882EFED8"
 # game's UI vtables, not one hot spot.
 [modules.functions."0x88B88420"]
 name = "sub_88B88420"
+
+# Reached while driving (not tied to any menu). Reproducible: two consecutive
+# runs died at exactly this address, so despite looking random it is a specific
+# code path, not a timing artefact. Sits in a 0x38-byte unregistered run
+# between 0x88E88200 and the real function 0x88E88238, so 0x88E88228 and
+# 0x88E88230 are probably thunks too - but only this one has a FATAL behind it,
+# and pinning on a guess is how a missing thunk turns into a bad jump elsewhere.
+[modules.functions."0x88E88220"]
+name = "sub_88E88220"
