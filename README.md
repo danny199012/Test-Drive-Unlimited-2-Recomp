@@ -5,6 +5,8 @@ A static recompilation of **Test Drive Unlimited 2** for Xbox 360 using the
 code is translated to C++ at build time by `rexglue codegen`, driven by
 `tdu2_manifest.toml`, and executed natively on Windows.
 
+![Party scene](screenshots/party_scene.jpg)
+
 ## Layout
 
 | Path | What it is |
