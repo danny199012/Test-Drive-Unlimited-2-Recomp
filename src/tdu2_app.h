@@ -6,10 +6,13 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
 
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
 #include <rex/ui/imgui_drawer.h>
@@ -48,6 +51,112 @@ class Tdu2App : public rex::ReXApp {
     tdu2::RegisterProfileCVars();
   }
 
+  // Dumps the render-to-texture settings, which govern whether content drawn
+  // into an offscreen target (the in-game photo, the licence portrait) survives
+  // long enough to be displayed. These live in the prebuilt GPU plugin, so
+  // their defaults cannot be read from source here - logging them at startup is
+  // the only way to see what is actually in force.
+  //
+  // Must run from OnPostSetup, not OnPreSetup: the GPU plugin registers its
+  // cvars when it loads during runtime setup, so at OnPreSetup every one of
+  // them still reads "<unregistered>".
+  //
+  // Uses the string-based accessor deliberately: the typed REXCVAR_DECLARE
+  // accessors live in rex/graphics/flags.h and would tie this header to the
+  // graphics module for no benefit.
+  static void LogTextureCVars() {
+    static const char* const kNames[] = {
+        "direct_host_resolve",
+        "texture_cache_memory_limit_render_to_texture",
+        "texture_cache_memory_limit_soft",
+        "gpu_allow_invalid_fetch_constants",
+        "gpu_3d_to_2d_texture",
+        "anisotropic_override",
+    };
+    for (const char* name : kNames) {
+      const std::string value = rex::cvar::GetFlagByName(name);
+      REXLOG_INFO("cvar {} = '{}'", name, value.empty() ? "<unregistered>" : value);
+    }
+  }
+
+  // Logs the cvars that decide how vertex/index data, memexport writes and
+  // shader pipelines reach the GPU. They are the candidate knobs for the
+  // intro-scene skinned-mesh corruption (shredded triangles / black wedges on
+  // the character): a wrong value here shows up as garbage vertex positions,
+  // never as a log error, so the value and its compiled-in default have to be
+  // readable from the log.
+  //
+  // Runs after LogTextureCVars for the same reason: the GPU plugin registers
+  // these when it loads during runtime setup.
+  static void LogVertexCorruptionCVars() {
+    static const char* const kNames[] = {
+        // GPU-written guest memory (memexport / resolve readback). If these
+        // writes are not coherent the CPU and the GPU see different vertex or
+        // matrix data for the same frame.
+        "readback_memexport",
+        "readback_memexport_fast",
+        "d3d12_readback_memexport",
+        "d3d12_readback_resolve",
+        "clear_memory_page_state",
+        // Vertex/index fetch and primitive processing.
+        "gpu_allow_invalid_fetch_constants",
+        "vfetch_full",
+        "vfetch_mini",
+        "xe_vertex_index_offset",
+        "primitive_processor_cache_min_indices",
+        "execute_unclipped_draw_vs_on_cpu",
+        "execute_unclipped_draw_vs_on_cpu_with_scissor",
+        "force_convert_quad_lists_to_triangle_lists",
+        "force_convert_triangle_fans_to_lists",
+        // Shader pipeline / translation and presentation geometry.
+        "async_shader_compilation",
+        "dump_shaders",
+        "d3d12_dxbc_disasm",
+        "half_pixel_offset",
+        "resolution_scale",
+        "direct_host_resolve",
+    };
+    for (const char* name : kNames) {
+      const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(name);
+      if (info == nullptr) {
+        REXLOG_INFO("cvar {} = <unregistered>", name);
+        continue;
+      }
+      REXLOG_INFO("cvar {} = '{}' (default '{}', source {})", name,
+                  rex::cvar::GetFlagByName(name), info->default_value,
+                  SourceName(rex::cvar::GetFlagSource(name)));
+    }
+
+    // Full registry dump next to the exe: which cvars exist, what they hold
+    // and what they would hold with no config at all. Written every run so a
+    // stale file cannot be mistaken for the current one.
+    std::ofstream dump("cvars_full.txt", std::ios::trunc);
+    if (dump) {
+      for (const rex::cvar::FlagEntry& entry : rex::cvar::GetRegistry()) {
+        dump << entry.name << " = '" << entry.getter() << "' (default '"
+             << entry.default_value << "')\n";
+      }
+    }
+  }
+
+  // Maps cvar::Source to a printable token. A local helper rather than a cast
+  // so the log reads "config" instead of "1".
+  static const char* SourceName(rex::cvar::Source source) {
+    switch (source) {
+      case rex::cvar::Source::kDefault:
+        return "default";
+      case rex::cvar::Source::kConfig:
+        return "config";
+      case rex::cvar::Source::kEnvironment:
+        return "env";
+      case rex::cvar::Source::kCommandLine:
+        return "cmdline";
+      case rex::cvar::Source::kRuntime:
+        return "runtime";
+    }
+    return "unknown";
+  }
+
   // The game opens "UPDATE:\" early. That is the Xbox 360's alias for the
   // title update container ($SystemUpdate). Without an update_data_root the
   // VFS has no device mounted there, so every resolve fails:
@@ -75,6 +184,11 @@ class Tdu2App : public rex::ReXApp {
   // editor and covers everything this does plus far more - this is just the
   // handful of things worth one keypress mid-game.
   void OnPostSetup() override {
+    // The GPU plugin has loaded by now, so its cvars exist and their real
+    // values can be read.
+    LogTextureCVars();
+    LogVertexCorruptionCVars();
+
     // Take over the guest's profile imports. This has to happen after the
     // modules have registered their function tables (OnPostLoadXexImage) but
     // before the guest starts calling them, so it is installed from

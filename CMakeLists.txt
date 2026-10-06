@@ -35,6 +35,13 @@ if(WIN32)
     target_compile_definitions(tdu2 PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# When the SDK is built from source (REXSDK_DIR), imgui headers live in the
+# SDK's thirdparty dir; the installed SDK instead installs them into its
+# include root, so this is only needed for source-tree builds.
+if(REXSDK_DIR AND TARGET imgui::imgui)
+    target_include_directories(tdu2 PRIVATE "${REXSDK_DIR}/thirdparty/imgui")
+endif()
+
 # Stage the cvar config next to the exe. The runtime reads tdu2.toml from the
 # exe's directory at startup, and the profile settings are rewritten there on
 # shutdown, so the file has to live there rather than in the source tree.

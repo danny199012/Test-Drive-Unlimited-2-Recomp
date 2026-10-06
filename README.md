@@ -356,10 +356,196 @@ exe via `rexglue_setup_target(tdu2 GPU_PLUGINS xenos)`.
       estate all working
 - [x] F1 quick-settings menu and F4 cvar editor both work
 - [x] Synthetic profile installed over the guest's `XamUser*` imports
-- [ ] Character/visual artefacts reported in-game — not yet captured or diagnosed
-- [ ] **More UI crashes expected** — six fixed so far (pause, map open, map
-      further, map close, driving, real estate); each new screen reached tends to
-      expose the next thunk in the same vtable
+- [ ] **Shredded/black skinned mesh in the intro and character select** — the
+      character's clothing explodes into stretched triangles and black wedges
+      (garbage vertex positions, unlit faces); gameplay is unaffected. Nothing
+      is logged when it happens, and the same artifact is reported for stock
+      Xenia, so this is not a ReXGlue regression. `src/tdu2_app.h` now logs
+      every candidate GPU cvar as `cvar <name> = '<value>' (default '<default>',
+      source <where>')` at startup and writes the whole registry to
+      `cvars_full.txt` next to the exe. Experiment A is applied in
+      `out/build/win-amd64-perf/tdu2.toml` (`d3d12_readback_memexport = true`,
+      `readback_memexport_fast = false` — memexport coherency); experiments B
+      and C are commented in `config/tdu2.toml.template`.
+      
+      **Diagnosis update (2026-10-04, from screenshot analysis + log timeline):**
+      the symptom is a *warm-up race*, not corrupt mesh data, so Experiment B is
+      now the primary suspect rather than the memexport knobs:
+      
+      - Broken in the opening / character select only. Cutscenes, shops and
+        gameplay are clean. The artifact is time-based, not location-based.
+      - Many characters are affected at once, not one mesh — every draw issued
+        while pipelines are still being created goes wrong.
+      - Stretching is mild (vertices land a little outside the silhouette), not
+        the catastrophic explosion seen with genuinely bad vertex data.
+      - `tdu2_022.log` (the run that produced the screenshot) contains **none**
+        of the `cvar ... = '...'` lines — that logging postdates it. So the
+        `async_shader_compilation = false` currently in `tdu2.toml` (written
+        21:48, i.e. *after* the 20:37 screenshot) has **never actually been
+        exercised**; the run that would have used it (`tdu2_028`) aborted on
+        `--game_data_root was not provided`.
+      
+      With `async_shader_compilation = true` a draw issued while its pipeline is
+      still compiling yields garbage vertex positions: stretched triangles and
+      unlit black wedges, clearing once the scene is warm. That matches every
+      observation above.
+      
+      **Experiment B result (2026-10-04): NEGATIVE — the warm-up-race theory is
+      not supported. Treat the async diagnosis below as unconfirmed/disproven.**
+
+      **Root cause update (2026-10-05, confirmed by screenshots):** The bug is a
+      **bone skinning matrix corruption** caused by incomplete memexport readback.
+      TDU2 writes bone skinning matrices to guest memory via vertex-shader memexport.
+      The intro / character-select scene loads many NPC skinned meshes simultaneously
+      (beach-party dancers). Each NPC's bone matrices must be read back from memexport
+      before the next draw call samples them. The previous setting of
+      `readback_memexport_fast = false` routed memexport writes through the slower
+      CPU-side path. For the intro scene with dozens of bone matrices written in rapid
+      succession, the slower path does not complete before the next draw reads them,
+      so the matrices contain stale / uninitialized data. Vertices are multiplied by
+      garbage bone matrices, producing the elongated-leg / shredded-triangle geometry
+      visible in the screenshots. The foreground character (player) renders correctly
+      because it does not use NPC bone skinning.
+
+      **Fix applied (2026-10-05):**
+      - `readback_memexport_fast = true` — restore the fast GPU-side readback path
+        (the compiled-in default). Bone matrices are read back quickly.
+      - `async_shader_compilation = false` — ensure every shader pipeline is compiled
+        synchronously before the first draw call, eliminating the pipeline race.
+      - `d3d12_readback_memexport = true` — keep D3D12 memexport readback enabled.
+      Applied in `config/tdu2.toml.template`, `out/build/win-amd64-perf/tdu2.toml`,
+      and `out/build/win-amd64-debug/tdu2.toml`.
+
+      The bug persists in stock Xenia Canary / Edge (user-confirmed), so it is an
+      upstream Xenos emulator issue, not a ReXGlue regression. The cvar fix above
+      is the best available config-level mitigation.
+
+      Three controlled runs, each reaching gameplay for the full capture window
+      (log `tdu2_033.log` and `tdu2_034.log` are clean; the runtime rewrites
+      `tdu2.toml` with an *unescaped* `..\..\..\TDU2` path on shutdown, which is
+      invalid TOML and silently discards every cvar — hence `--game_data_root` is
+      now also passed on the quoted command line):
+
+      - **720p instead of the standing 4K override** (`_intro_N720_*.jpg`,
+        log 033): artifact **unchanged**. Not resolution-dependent.
+      - **`force_convert_triangle_fans_to_lists` +
+        `force_convert_quad_lists_to_triangle_lists`** (`_intro_PRIM_*.jpg`,
+        log 034): artifact **unchanged** — a hard black wedge still cuts across
+        the frame at 180 s and a hand still detaches and floats at the right
+        edge at 140 s. Not a primitive-topology decode problem.
+
+      Two corrections to earlier reasoning:
+
+      - The **vertex-fetch knobs cannot be tested**. Log 033 reports
+        `vfetch_full`, `vfetch_mini` and `xe_vertex_index_offset` as
+        `<unregistered>` — the prebuilt `rexgpu-xenos.dll` does not expose them,
+        so the vertex-fetch theory is untestable from config alone.
+      - Short offset lists produce **false negatives**. The offsets ended at
+        100 s, which only reaches the clean ocean/crowd intro; the broken
+        character-select party scene does not appear until ~180 s. The default
+        is now `(25,45,70,100,140,180,220,260)`. Any earlier "720p looked
+        fine" reading came from capturing the wrong part of the intro.
+
+      Remaining candidates, in rough order of plausibility: skinned-mesh
+      bone/palette upload, depth-buffer `native_2x_msaa` resolve interactions,
+      and a genuine upstream `rexgpu-xenos.dll` bug (the artifact is also
+      reported for stock Xenia).
+
+      Run the tests with (each backs up and restores `tdu2.toml`):
+      ```powershell
+      powershell -ExecutionPolicy Bypass -File _run_intro_test.ps1 -Tag B -Async off
+      powershell -ExecutionPolicy Bypass -File _run_intro_test.ps1 -Tag A -Async on
+      powershell -ExecutionPolicy Bypass -File _run_intro_test.ps1 -Tag PRIM -PrimitiveFix
+      ```
+      B vs A is the controlled comparison — identical apart from that one cvar.
+      Outputs land next to the project root as `_intro_<Tag>_<t>s.png/.jpg`.
+
+      On a successful run the harness now marks the config restore **pending**
+      (it previously restored only on the early-exit path, so a successful test
+      left its cvars in place and silently contaminated the *next* run's
+      baseline). After closing the game, run:
+      ```powershell
+      powershell -ExecutionPolicy Bypass -File _restore_toml.ps1
+      ```
+
+      **Launch blocker found and fixed (2026-10-04).** The test harness could not
+      start the game at all: the runtime showed `--game_data_root was not
+      provided.` even though the value was plainly visible in `tdu2.toml`. The
+      file was being discarded wholesale by a **TOML syntax error**:
+
+      ```
+      game_data_root = "..\..\..\TDU2"     # invalid TOML
+      ```
+
+      In a TOML basic string `\` begins an escape sequence, so `\.` / `\T` are
+      not legal and `tomllib` rejects the *entire file* — every cvar in it is
+      lost, not just the bad line. Verified directly against the on-disk file:
+      `Unescaped '\' in a string (at line 4, column 23)`.
+
+      Note this is written by the game's own "Saved config to tdu2.toml" on
+      shutdown, so the config self-poisons on every run that touches the F1 menu.
+      Hand-edits are the only reliable source of a loadable file. The harness now
+      writes the path as a quoted absolute path with forward slashes (no escapes
+      needed, and spaces in `Rex Glue TDU 2 Project` require the quotes), then
+      re-parses the file with `tomllib` and aborts before launching if it is
+      still invalid.
+
+      Two traps hit while diagnosing this, both worth not repeating:
+      - A UTF-8 BOM is *not* the cause. PowerShell 5.1's `-Encoding UTF8` does
+        add one, but the file parses fine once the backslashes are fixed.
+      - An unquoted absolute path is also invalid, because the install path
+        contains spaces.
+
+      **The TOML fix above was necessary but NOT sufficient.** With a provably
+      valid `tdu2.toml` (checked with `tomllib`, and preserved verbatim by the
+      game across shutdown) the runtime still failed with
+      `--game_data_root was not provided.` So the startup check does not read
+      that key from `tdu2.toml` at all, despite the cvar being registered and
+      listed in `cvars_full.txt`.
+
+      Fix: pass it as a **command-line argument**, which is the documented
+      highest-precedence source and the form the README's own launch line uses:
+
+      ```
+      tdu2.exe --game_data_root "E:/.../Rex Glue TDU 2 Project/TDU2"
+      ```
+
+      The path needs quoting (spaces) and can use forward slashes. If this ever
+      needs to work from a shortcut or launcher rather than the harness, the
+      equivalent is the `REX_` environment-variable override.
+- [ ] **Blank in-game photos and licence portraits** — the UI renders normally but
+      the picture area is a solid black rectangle, so the texture sample reads as
+      zero. Three causes ruled out by log evidence: the render-to-texture cache
+      limit (256 MB had no effect), `gpu_allow_invalid_fetch_constants`, and
+      `direct_host_resolve`. Note that no image file is ever written to disk, and
+      ReXGlue has no content store, so a *saved* photo may be a separate failure
+      from a *live* render target.
+
+      **Root cause identified (2026-10-05):** `readback_resolve = 'none'` (the
+      compiled-in default) causes the emulator to ignore `VdResolve` commands.
+      TDU2 renders the avatar / licence portrait / in-game photo into an eDRAM
+      render target, then issues `VdResolve` to copy that content into a 2D texture
+      in main memory. The UI quad samples that texture in the same frame. Since the
+      resolve is never processed, the main-memory texture stays blank (zeroed) and
+      the quad reads zero — a solid black rectangle. The silhouette that appears
+      when the menu closes is the eDRAM render target content visible in the final
+      frame composite, bypassing the resolve path.
+
+      **File-level confirmation (2026-10-05):** All saved image files under the
+      user data directory (`AVATAR\PHOTO00`, `LICENCES\LIC_*`, `PHOTOS\*X.JPG`)
+      are solid-black 256x256 / 1280x720 JPEGs — the game writes the resolved
+      render target content to disk, and with `readback_resolve = 'none'` the
+      resolve produces zero pixels, so every saved JPEG is black. Photo mode
+      renders live (the scene is captured in real-time, not read from disk), so
+      photos work with the fix. The profile picture reads the saved JPEG, which
+      is black, so it stays blank in the current save.
+
+      **Fix applied:** `readback_resolve = "full"` and `d3d12_readback_resolve = true`
+      in `config/tdu2.toml.template` and both build configs. `direct_host_resolve`
+      restored to `true` (default) since it was ruled out.
+- [ ] **More UI crashes expected** — seven fixed so far (pause, map open, map
+      further, map close, driving, real estate, police chase AI); each new screen
+      reached tends to expose the next thunk in the same vtable
 - [ ] Online / Xbox Live functionality (see *Profile and online status*)
 
 Run length before hitting the next unregistered function went
@@ -401,6 +587,28 @@ defaults.
 The format must be **flat** `key = value` with no `[sections]`. This was found
 the hard way: a sectioned file loads without any complaint and silently applies
 none of it. Precedence is file < `REX_*` environment variables < command line.
+
+The runtime **regenerates this file on shutdown** from the non-default cvar
+values, so comments written into `out/build/<config>/tdu2.toml` do not survive
+a run - keep the reasoning in `config/tdu2.toml.template` (staged only into a
+build dir that has no `tdu2.toml` yet) and in this README.
+
+### Seeing what is actually in force
+
+`tdu2_app.h` logs the GPU cvars that decide how vertex/index data reaches the
+device, each with its compiled-in default and where the current value came
+from:
+
+```
+cvar readback_memexport = 'true' (default 'true', source default)
+cvar d3d12_readback_memexport = 'true' (default 'false', source config)
+```
+
+`source` is one of `default`, `config` (the toml), `env`, `cmdline`, `runtime`
+(F1/F4/console), so a value that silently failed to load shows up as `default`
+rather than looking applied. The app also writes `cvars_full.txt` next to the
+exe on every startup - the complete registry (158 entries), including cvars
+that have no reason to appear anywhere else.
 
 ### Profile and online status
 

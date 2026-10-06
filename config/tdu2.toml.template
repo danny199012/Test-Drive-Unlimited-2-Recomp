@@ -29,6 +29,47 @@ video_mode_refresh_rate = 60
 # middle ground; info is normal play.
 log_level = "info"
 
+# --- GPU texture compatibility ------------------------------------------------
+#
+# TDU2 sets some texture fetch constants to a type the Xenos translator calls
+# "invalid" and refuses to bind, logging:
+#   Texture fetch constant (...) has "invalid" type! This is incorrect behavior,
+#   but you can try bypassing this by ... gpu_allow_invalid_fetch_constants
+# When that happens the sampler ends up with nothing bound, which is why
+# in-game photos came out blank and the licence portrait showed nothing.
+#
+# Inherited from Xenia's --gpu_allow_invalid_fetch_constants. The runtime calls
+# it incorrect behaviour, but the real hardware clearly tolerated it.
+gpu_allow_invalid_fetch_constants = true
+
+# Budget (MB) the texture cache may spend on render-to-texture targets. Stock
+# value is 24, against a 384 MB general soft limit.
+#
+# RULED OUT: raised to 256 to test the theory that the offscreen buffer a photo
+# or licence portrait is drawn into fails to allocate and comes back blank. Run
+# tdu2_015 confirmed 256 was in force (see logs/tdu2_015.log line 17) and the
+# images were still blank, so the allocation was never the cause. Left at 24.
+texture_cache_memory_limit_render_to_texture = 24
+
+# --- Profile / photo render-to-texture resolve ------------------------------
+#
+# ROOT CAUSE (2026-10-05): TDU2 renders the avatar / licence portrait / in-game
+# photo into an eDRAM render target, then issues VdResolve to copy that content
+# into a 2D texture in main memory. The UI quad samples that texture in the same
+# frame. With readback_resolve = 'none' (the compiled-in default) the emulator
+# ignores the resolve command, so the main-memory texture stays blank and the
+# quad reads zero -- a solid black rectangle. The silhouette that appears when
+# the menu closes is the eDRAM render target content visible in the final frame
+# composite, bypassing the resolve path entirely.
+#
+# Fix: enable readback_resolve so the resolve command is processed synchronously,
+# and enable d3d12_readback_resolve so the D3D12 pipeline copies the resolved
+# texture back into guest memory. Restore direct_host_resolve to its default (true)
+# since it was ruled out as a cause (tested both ways, both blank).
+readback_resolve = "full"
+d3d12_readback_resolve = true
+direct_host_resolve = true
+
 # --- Synthetic dashboard profile -------------------------------------------
 #
 # ReXGlue emulates no dashboard and no user accounts, so there is no signed-in
@@ -40,3 +81,30 @@ log_level = "info"
 profile_name = "ReXGlue Player"
 profile_xuid = 2533274793222573
 profile_signed_in = true
+
+# --- Intro-scene skinned-mesh corruption ------------------------------------
+#
+# Symptom: the character in the intro / character-select scene renders as
+# shredded triangles and black wedges (garbage vertex positions, unlit faces);
+# gameplay is unaffected. Nothing is logged when it happens, so the only
+# evidence is what each cvar was set to - read the startup lines
+#   cvar <name> = '<value>' (default '<default>', source <where>)
+# and the full registry dump the app writes to cvars_full.txt next to the exe.
+#
+# A - memexport coherency (applied in out/build/win-amd64-perf/tdu2.toml):
+#     d3d12_readback_memexport defaults to false, so shader memexport writes
+#     are never read back on this backend, and the fast readback path may
+#     skip ranges. Both decide how fresh the CPU and the GPU see the same
+#     vertex/matrix buffer - exactly the failure mode above.
+d3d12_readback_memexport = true
+readback_memexport_fast = true
+#
+# B - rule out a pipeline-compile race (artifacts that vanish after a frame or
+#     two are usually this):
+async_shader_compilation = false
+#
+# C - D3D12 validation layer + verbose logging while the intro plays; expect a
+#     noisy log, look for out-of-bounds / stride complaints in the frame the
+#     character appears:
+# d3d12_debug = true
+# log_verbose = true

@@ -1,0 +1,987 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 96d362b..1b7a646 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -19,6 +19,7 @@
+ #include <optional>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -760,6 +761,18 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   // Temporary storage for memexport stream constants used in the draw.
+   std::vector<draw_util::MemExportRange> memexport_ranges_;
++
++  // Vertex shaders whose vertex fetch constants were already logged by
++  // memexport_debug_log (diagnosis of skinned-mesh corruption).
++  std::unordered_set<uint64_t> memexport_vfetch_logged_shaders_;
++
++  // Draw configurations already logged by memexport_debug_log.
++  std::unordered_set<uint64_t> draw_diag_logged_;
++
++  // Vertex stream float-sanity dumps (memexport_debug_log): shaders dumped and
++  // total dump budget.
++  std::unordered_set<uint64_t> vertex_stream_dumped_shaders_;
++  uint32_t vertex_stream_dump_count_ = 0;
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 2cf24c4..5407765 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -18,6 +18,10 @@ REXCVAR_DECLARE(bool, vsync);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);
++REXCVAR_DECLARE(bool, memexport_debug_log);
++// Defined in the memory subsystem (xmemory); also gates the verbose
++// shared-memory/vertex-fetch diagnosis logs in the GPU backends.
++REXCVAR_DECLARE(bool, memwatch_debug_log);
+ 
+ // GPU Resolution / Readback / Queries
+ REXCVAR_DECLARE(int32_t, resolution_scale);
+diff --git a/include/rex/graphics/pipeline/shader/shader.h b/include/rex/graphics/pipeline/shader/shader.h
+index 4cf3854..52d744d 100644
+--- a/include/rex/graphics/pipeline/shader/shader.h
++++ b/include/rex/graphics/pipeline/shader/shader.h
+@@ -835,6 +835,13 @@ class Shader {
+   const uint32_t* ucode_dwords() const { return ucode_data_.data(); }
+   size_t ucode_dword_count() const { return ucode_data_.size(); }
+ 
++  // Guest address the microcode was loaded from (for pointer-based shader
++  // loads; 0 for embedded/immediate loads and other cases where the address
++  // isn't a stable guest location). Used to detect games mutating shader
++  // programs in place after the shader has been loaded and cached.
++  uint32_t ucode_guest_address() const { return ucode_guest_address_; }
++  void set_ucode_guest_address(uint32_t address) { ucode_guest_address_ = address; }
++
+   bool is_ucode_analyzed() const { return is_ucode_analyzed_; }
+   // ucode_disasm_buffer is temporary storage for disassembly (provided
+   // externally so it won't need to be reallocated for every shader).
+@@ -984,6 +991,7 @@ class Shader {
+   xenos::ShaderType shader_type_;
+   std::vector<uint32_t> ucode_data_;
+   uint64_t ucode_data_hash_;
++  uint32_t ucode_guest_address_ = 0;
+ 
+   // Whether info needed before translating has been gathered already - may be
+   // needed to determine which modifications are actually needed and make sense
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..b9a99bc 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -95,6 +95,14 @@ class SharedMemory {
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
++  // Marks CPU-uploaded pages in the range as invalid so the next RequestRange
++  // copies the current guest memory to the GPU buffer again. Pages containing
++  // GPU-written data are skipped, so render targets and memexport destinations
++  // are not overwritten with CPU data. Use for streaming vertex/index data the
++  // CPU rewrites in place at addresses whose writes cannot be caught by the
++  // physical memory write watches.
++  void InvalidateUploadedRange(uint32_t start, uint32_t length);
++
+  protected:
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..a0c7813 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -624,6 +624,16 @@ class Memory {
+   rex::thread::global_critical_region global_critical_region_;
+   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
+       physical_memory_invalidation_callbacks_;
++
++  // Write-watch notification bits for the identity mapping of the first 512 MB
++  // of physical memory (guest virtual address equals the physical one in the
++  // 0x00000000 virtual heap). Games write GPU-visible data through this window
++  // directly, and the physical heap aliases cannot catch those writes because
++  // they are hosted by different views. One bit per 4 KB page, guarded by the
++  // global critical region.
++  static constexpr uint32_t kIdentityWindowSizeLog2 = 29;  // 512 MB
++  static constexpr uint32_t kIdentityPageSizeLog2 = 12;    // 4 KB
++  std::vector<uint64_t> identity_window_notify_pages_;
+ };
+ 
+ }  // namespace rex::memory
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..b042f79 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -1894,9 +1894,54 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  // Snapshot a few resident small vertex fetch buffers (bone palettes and the
++  // like) before the residency reset below, for the ground-truth comparison
++  // after BeginSubmission.
++  struct VerifyRange {
++    uint32_t address;
++    uint32_t size;
++    uint32_t vfetch_index;
++  };
++  VerifyRange verify_ranges[3];
++  uint32_t verify_range_count = 0;
++  static uint32_t vfetch_verify_count = 0;
++  constexpr uint32_t kVfetchVerifyMax = 200;
++  if (REXCVAR_GET(memexport_debug_log) && vfetch_verify_count < kVfetchVerifyMax) {
++    for (uint32_t vfetch_index = 0;
++         vfetch_index < uint32_t(vertex_buffer_states_.size()) && verify_range_count < 3;
++         ++vfetch_index) {
++      const VertexBufferState& state = vertex_buffer_states_[vfetch_index];
++      if (state.address == UINT32_MAX || state.size == UINT32_MAX || state.size == 0 ||
++          state.size > 1024) {
++        continue;
++      }
++      verify_ranges[verify_range_count].address = state.address << 2;
++      verify_ranges[verify_range_count].size = state.size << 2;
++      verify_ranges[verify_range_count].vfetch_index = vfetch_index;
++      ++verify_range_count;
++    }
++    if (vfetch_verify_count == 0) {
++      REXGPU_INFO("VFetch verify: snapshot {} buffers, sync bits {:016X}",
++                  verify_range_count, vertex_buffers_in_sync_[0]);
++    }
++  }
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
++  // Diagnosis experiment: force re-upload of vertex fetch buffers for the
++  // next frame. The CPU rewrites streaming data (bone palettes, dynamic
++  // vertices) in place, and if any write path escapes the write watches this
++  // would mask it. Kept cvar-gated: it measurably costs upload bandwidth
++  // (re-uploads all vertex fetch buffers, including the large tables, every
++  // frame) and showed no visual effect on the TDU 2 skinned-mesh artifact.
++  if (shared_memory_ && REXCVAR_GET(memwatch_debug_log)) {
++    for (VertexBufferState& state : vertex_buffer_states_) {
++      if (state.address != UINT32_MAX && state.size != UINT32_MAX && state.size != 0) {
++        shared_memory_->InvalidateUploadedRange(state.address << 2, state.size << 2);
++      }
++    }
++  }
++
+   if (!graphics_system_)
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
+@@ -1911,6 +1956,87 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+     return;
+   }
+ 
++  {
++    // Copy the snapshotted vertex fetch buffers out of the shared memory buffer
++    // and compare, byte for byte, with what the guest has in physical memory
++    // right now. Ground truth for the skinned-mesh staleness question: GPU
++    // bytes differing from the guest's means the draws of the last frame
++    // consumed stale data; matching implausible bytes means the guest itself
++    // wrote garbage.
++    if (verify_range_count) {
++      uint32_t total_size = (verify_ranges[0].size + verify_ranges[1].size +
++                             verify_ranges[2].size + 0xFFF) & ~0xFFFu;
++      ID3D12Resource* readback_buffer = RequestReadbackBuffer(total_size);
++      if (readback_buffer) {
++        shared_memory_->UseAsCopySource();
++        SubmitBarriers();
++        ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
++        uint32_t copy_offset = 0;
++        for (uint32_t i = 0; i < verify_range_count; ++i) {
++          deferred_command_list_.D3DCopyBufferRegion(readback_buffer, copy_offset,
++                                                     shared_memory_buffer,
++                                                     verify_ranges[i].address,
++                                                     verify_ranges[i].size);
++          copy_offset += verify_ranges[i].size;
++        }
++        if (AwaitAllQueueOperationsCompletion()) {
++          D3D12_RANGE map_range;
++          map_range.Begin = 0;
++          map_range.End = copy_offset;
++          void* mapping = nullptr;
++          if (SUCCEEDED(readback_buffer->Map(0, &map_range, &mapping))) {
++            const uint8_t* gpu_bytes = static_cast<const uint8_t*>(mapping);
++            for (uint32_t i = 0; i < verify_range_count; ++i) {
++              const uint8_t* guest_bytes = memory_->TranslatePhysical(verify_ranges[i].address);
++              uint32_t mismatch_dwords = 0;
++              uint32_t first_mismatch = UINT32_MAX;
++              for (uint32_t dword = 0; dword < verify_ranges[i].size >> 2; ++dword) {
++                if (std::memcmp(gpu_bytes + (dword << 2), guest_bytes + (dword << 2), 4) != 0) {
++                  ++mismatch_dwords;
++                  if (first_mismatch == UINT32_MAX) {
++                    first_mismatch = dword;
++                  }
++                }
++              }
++              ++vfetch_verify_count;
++              if (mismatch_dwords) {
++                auto dump = [](const uint8_t* bytes) {
++                  return fmt::format("{:08X} {:08X} {:08X} {:08X}",
++                                     rex::memory::load<uint32_t>(bytes),
++                                     rex::memory::load<uint32_t>(bytes + 4),
++                                     rex::memory::load<uint32_t>(bytes + 8),
++                                     rex::memory::load<uint32_t>(bytes + 12));
++                };
++                uint32_t mismatch_offset = first_mismatch == UINT32_MAX ? 0 : first_mismatch << 2;
++                REXGPU_WARN(
++                    "VFetch verify: buffer {} 0x{:08X} ({} bytes) STALE - {}/{} dwords "
++                    "differ, first at {}. GPU bytes at mismatch: {}. Guest bytes: {}",
++                    verify_ranges[i].vfetch_index, verify_ranges[i].address,
++                    verify_ranges[i].size, mismatch_dwords, verify_ranges[i].size >> 2,
++                    first_mismatch << 2, dump(gpu_bytes + mismatch_offset),
++                    dump(guest_bytes + mismatch_offset));
++              } else if (vfetch_verify_count <= 10) {
++                REXGPU_INFO(
++                    "VFetch verify: buffer {} 0x{:08X} ({} bytes) matches guest memory "
++                    "(GPU {:08X} {:08X} {:08X} {:08X})",
++                    verify_ranges[i].vfetch_index, verify_ranges[i].address,
++                    verify_ranges[i].size, rex::memory::load<uint32_t>(gpu_bytes),
++                    rex::memory::load<uint32_t>(gpu_bytes + 4),
++                    rex::memory::load<uint32_t>(gpu_bytes + 8),
++                    rex::memory::load<uint32_t>(gpu_bytes + 12));
++              }
++              gpu_bytes += verify_ranges[i].size;
++            }
++            D3D12_RANGE written_range;
++            written_range.Begin = 0;
++            written_range.End = 0;
++            readback_buffer->Unmap(0, &written_range);
++          }
++        }
++      }
++    }
++  }
++
+   // Obtain the actual swap source texture size (resolution-scaled if it's a
+   // resolve destination, or not otherwise).
+   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
+@@ -2265,7 +2391,18 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+ 
+ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+                                           const uint32_t* host_address, uint32_t dword_count) {
+-  return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
++  Shader* shader = pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
++  // Remember where the microcode lives in guest memory - but only for genuine
++  // physical addresses (identity-mapped). Immediate/embedded shader loads pass
++  // a pointer into the PM4 ring buffer truncated to 32 bits; such addresses
++  // are not stable guest locations (the ring recycles constantly), and
++  // treating them as watchable ucode sources causes spurious mutation
++  // detection and garbage shader re-loads.
++  if (guest_address != 0 && guest_address < 0x20000000 &&
++      memory_->GetPhysicalAddress(guest_address) == guest_address) {
++    shader->set_ucode_guest_address(guest_address);
++  }
++  return shader;
+ }
+ 
+ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+@@ -2275,6 +2412,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  {
++    static uint32_t issue_draw_probe_count = 0;
++    if (issue_draw_probe_count++ < 5) {
++      REXGPU_INFO("IssueDraw probe: entered, prim {} index_count {}", uint32_t(primitive_type),
++                  index_count);
++    }
++  }
++
+   ID3D12Device* device = GetD3D12Provider().GetDevice();
+   const RegisterFile& regs = *register_file_;
+ 
+@@ -2292,6 +2437,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     // Always need a vertex shader.
+     return false;
+   }
++  {
++    // Detect games mutating shader microcode in place after the shader has
++    // been loaded (TDU 2 does this for its skinned characters - each character
++    // patches the program, and the cached translation of the first variant
++    // would be reused for all of them, corrupting the later ones). If the
++    // guest memory at the shader's load address no longer hashes to the
++    // cached value, re-load the shader so the new program is analyzed and
++    // translated as its own entry.
++    static uint32_t ucode_mutation_log_count = 0;
++    uint32_t guest_address = vertex_shader->ucode_guest_address();
++    if (guest_address != 0 && guest_address < 0x20000000 &&
++        memory_->GetPhysicalAddress(guest_address) != UINT32_MAX) {
++      const uint32_t* live_words = memory_->TranslatePhysical<uint32_t*>(guest_address);
++      size_t word_count = vertex_shader->ucode_dword_count();
++      uint64_t live_hash = XXH3_64bits(live_words, word_count * sizeof(uint32_t));
++      if (live_hash != vertex_shader->ucode_data_hash()) {
++        if (ucode_mutation_log_count < 100) {
++          ++ucode_mutation_log_count;
++          REXGPU_WARN(
++              "UCODE MUTATED: vertex shader {:016X} at guest {:08X} now hashes {:016X} - "
++              "re-loading (mutation {})",
++              vertex_shader->ucode_data_hash(), guest_address, live_hash,
++              ucode_mutation_log_count);
++        }
++        vertex_shader = static_cast<D3D12Shader*>(pipeline_cache_->LoadShader(
++            xenos::ShaderType::kVertex, live_words, uint32_t(word_count)));
++      }
++    }
++  }
+   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+ 
+@@ -2310,6 +2484,28 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     if (edram_mode == xenos::EdramMode::kColorDepth) {
+       pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
+       if (pixel_shader) {
++        // Same in-place mutation check as for the vertex shader.
++        static uint32_t ps_ucode_mutation_log_count = 0;
++        uint32_t ps_guest_address = pixel_shader->ucode_guest_address();
++        if (ps_guest_address != 0 && ps_guest_address < 0x20000000 &&
++            memory_->GetPhysicalAddress(ps_guest_address) != UINT32_MAX) {
++          const uint32_t* ps_live_words =
++              memory_->TranslatePhysical<uint32_t*>(ps_guest_address);
++          size_t ps_word_count = pixel_shader->ucode_dword_count();
++          uint64_t ps_live_hash = XXH3_64bits(ps_live_words, ps_word_count * sizeof(uint32_t));
++          if (ps_live_hash != pixel_shader->ucode_data_hash()) {
++            if (ps_ucode_mutation_log_count < 100) {
++              ++ps_ucode_mutation_log_count;
++              REXGPU_WARN(
++                  "UCODE MUTATED: pixel shader {:016X} at guest {:08X} now hashes {:016X} - "
++                  "re-loading (mutation {})",
++                  pixel_shader->ucode_data_hash(), ps_guest_address, ps_live_hash,
++                  ps_ucode_mutation_log_count);
++            }
++            pixel_shader = static_cast<D3D12Shader*>(pipeline_cache_->LoadShader(
++                xenos::ShaderType::kPixel, ps_live_words, uint32_t(ps_word_count)));
++          }
++        }
+         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
+           pixel_shader = nullptr;
+@@ -2477,6 +2673,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+ 
+   // Ensure vertex buffers are resident.
+   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
++  if (REXCVAR_GET(memwatch_debug_log) &&
++      !memexport_vfetch_logged_shaders_.count(vertex_shader->ucode_data_hash())) {
++    memexport_vfetch_logged_shaders_.insert(vertex_shader->ucode_data_hash());
++    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
++      uint32_t vfetch_bits = constant_map_vertex.vertex_fetch_bitmap[i];
++      uint32_t j;
++      while (rex::bit_scan_forward(vfetch_bits, &j)) {
++        vfetch_bits &= ~(uint32_t(1) << j);
++        uint32_t vfetch_index = i * 32 + j;
++        xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(vfetch_index);
++        REXGPU_INFO("VFetch map: VS ucode {:016X} buffer {} address 0x{:08X} size {}",
++                    vertex_shader->ucode_data_hash(), vfetch_index, vf.address << 2,
++                    vf.size << 2);
++      }
++    }
++  }
+   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+     uint32_t j;
+@@ -2511,6 +2723,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+         continue;
+       }
++      if (REXCVAR_GET(memwatch_debug_log) && (vfetch_constant.size << 2) <= 512) {
++        REXGPU_INFO(
++            "VFetch request: VS ucode {:016X} buffer {} 0x{:08X} ({} bytes), was 0x{:08X} "
++            "({} bytes)",
++            vertex_shader->ucode_data_hash(), vfetch_index, vfetch_constant.address << 2,
++            vfetch_constant.size << 2, state.address == UINT32_MAX ? 0 : state.address << 2,
++            state.size == UINT32_MAX ? 0 : state.size << 2);
++      }
+       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+         REXGPU_ERROR(
+             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
+@@ -2545,6 +2765,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     }
+   }
+   if (memexport_used && memexport_ranges_.empty()) {
++    if (REXCVAR_GET(memwatch_debug_log)) {
++      REXGPU_INFO(
++          "MemExport draw: VS ucode {:016X} exports but no stream ranges resolved - using "
++          "conservative full shared memory residency (CPU readback skipped for this draw)",
++          vertex_shader->ucode_data_hash());
++    }
+     if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+       REXGPU_ERROR(
+           "Failed to request full shared memory residency for unresolved "
+@@ -2552,6 +2778,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       return false;
+     }
+   }
++  if (REXCVAR_GET(memwatch_debug_log) && !memexport_ranges_.empty()) {
++    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
++      REXGPU_INFO(
++          "MemExport draw: VS ucode {:016X} range 0x{:08X} ({} bytes), {} vertices",
++          vertex_shader->ucode_data_hash(), memexport_range.base_address_dwords << 2,
++          memexport_range.size_bytes, primitive_processing_result.host_draw_vertex_count);
++    }
++  }
+ 
+   // Primitive topology.
+   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
+@@ -2617,6 +2851,130 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   SetPrimitiveTopology(primitive_topology);
+   // Must not call anything that may change the primitive topology from now on!
+ 
++  {
++    static uint32_t topology_probe_count = 0;
++    if (topology_probe_count++ < 5) {
++      REXGPU_INFO("IssueDraw probe: reached topology, prim {} index_count {}",
++                  uint32_t(primitive_processing_result.host_primitive_type),
++                  primitive_processing_result.host_draw_vertex_count);
++    }
++  }
++
++  if (REXCVAR_GET(memexport_debug_log)) {
++    uint64_t draw_key = vertex_shader->ucode_data_hash() ^
++                        (uint64_t(primitive_processing_result.IsTessellated() ? 1 : 0) << 62) ^
++                        (uint64_t(primitive_processing_result.host_primitive_type) << 56) ^
++                        (uint64_t(primitive_processing_result.index_buffer_type) << 48);
++    if (!draw_diag_logged_.count(draw_key)) {
++      draw_diag_logged_.insert(draw_key);
++      REXGPU_INFO(
++          "Draw: VS ucode {:016X} tessellated {} prim {} index_type {} vertices {} "
++          "multi_prim_ib {} reset_indx {:04X} index_endian {}",
++          vertex_shader->ucode_data_hash(),
++          primitive_processing_result.IsTessellated() ? "yes" : "no",
++          uint32_t(primitive_processing_result.host_primitive_type),
++          uint32_t(primitive_processing_result.index_buffer_type),
++          primitive_processing_result.host_draw_vertex_count,
++          regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena ? 1 : 0,
++          regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx,
++          uint32_t(regs.Get<reg::VGT_DMA_SIZE>().swap_mode));
++    }
++
++    // Float-sanity dump for the large skinned mesh draws (the ribbon-prone
++    // ones): for each vertex fetch buffer of the draw, analyze the guest bytes
++    // as float32 (NaN/inf/huge counts) and dump the head, plus index buffer
++    // stats. Separates "guest wrote garbage" from "shader misreads good data".
++    if (vertex_shader->ucode_data_hash() != 0 &&
++        primitive_processing_result.host_draw_vertex_count <= 500 &&
++        primitive_processing_result.host_draw_vertex_count > 0 &&
++        vertex_stream_dump_count_ < 80 &&
++        !vertex_stream_dumped_shaders_.count(vertex_shader->ucode_data_hash())) {
++      vertex_stream_dumped_shaders_.insert(vertex_shader->ucode_data_hash());
++      ++vertex_stream_dump_count_;
++      {
++        // First microcode words, so the same shader can be located in real
++        // console RAM dumps (the ucode is identical data on hardware). Never
++        // read past the shader's own dword count - short shaders exist.
++        const uint32_t* ucode_words = vertex_shader->ucode_dwords();
++        size_t ucode_count = vertex_shader->ucode_dword_count();
++        std::string ucode_hex;
++        for (size_t wi = 0; wi < ucode_count && wi < 24; ++wi) {
++          fmt::format_to(std::back_inserter(ucode_hex), "{:08X} ", ucode_words[wi]);
++        }
++        REXGPU_INFO("UCode words: {:016X} w {}", vertex_shader->ucode_data_hash(), ucode_hex);
++      }
++      const Shader::ConstantRegisterMap& dump_map = vertex_shader->constant_register_map();
++      for (uint32_t i = 0; i < rex::countof(dump_map.vertex_fetch_bitmap); ++i) {
++        uint32_t dump_bits = dump_map.vertex_fetch_bitmap[i];
++        uint32_t bit;
++        while (rex::bit_scan_forward(dump_bits, &bit)) {
++          dump_bits &= ~(uint32_t(1) << bit);
++          uint32_t vfetch_index = i * 32 + bit;
++          xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(vfetch_index);
++          if (vf.type != xenos::FetchConstantType::kVertex || vf.size == 0) {
++            continue;
++          }
++          uint32_t bytes = vf.size << 2;
++          const uint8_t* guest_bytes = memory_->TranslatePhysical(vf.address << 2);
++          if (!guest_bytes) {
++            continue;
++          }
++          uint32_t total = bytes >> 2, nan_count = 0, inf_count = 0, huge_count = 0,
++                   zero_count = 0;
++          for (uint32_t d = 0; d < total; ++d) {
++            float f;
++            std::memcpy(&f, guest_bytes + (d << 2), 4);
++            if (std::isnan(f)) {
++              ++nan_count;
++            } else if (std::isinf(f)) {
++              ++inf_count;
++            } else if (f == 0.0f) {
++              ++zero_count;
++            } else if (std::abs(f) > 1e9f) {
++              ++huge_count;
++            }
++          }
++          auto dump = [](const uint8_t* bytes) {
++            return fmt::format(
++                "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
++                rex::memory::load<uint32_t>(bytes), rex::memory::load<uint32_t>(bytes + 4),
++                rex::memory::load<uint32_t>(bytes + 8), rex::memory::load<uint32_t>(bytes + 12),
++                rex::memory::load<uint32_t>(bytes + 16), rex::memory::load<uint32_t>(bytes + 20),
++                rex::memory::load<uint32_t>(bytes + 24),
++                rex::memory::load<uint32_t>(bytes + 28));
++          };
++          REXGPU_INFO(
++              "VStream dump: VS ucode {:016X} vfetch {} 0x{:08X} ({} bytes): dwords {} nan {} "
++              "inf {} huge {} zero {} | head: {} | f0..3: {} {} {} {}",
++              vertex_shader->ucode_data_hash(), vfetch_index, vf.address << 2, bytes, total,
++              nan_count, inf_count, huge_count, zero_count, dump(guest_bytes),
++              rex::memory::load<float>(guest_bytes), rex::memory::load<float>(guest_bytes + 4),
++              rex::memory::load<float>(guest_bytes + 8),
++              rex::memory::load<float>(guest_bytes + 12));
++        }
++      }
++      // Index buffer sanity: raw guest u16 values with k8in16 byte swap.
++      if (primitive_processing_result.index_buffer_type ==
++          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
++        uint32_t index_base = regs[XE_GPU_REG_VGT_DMA_BASE];
++        uint32_t index_count = primitive_processing_result.host_draw_vertex_count;
++        const uint8_t* index_bytes = memory_->TranslatePhysical(index_base);
++        if (index_bytes) {
++          uint32_t max_index = 0;
++          for (uint32_t i = 0; i < index_count && i < 100000; ++i) {
++            uint16_t raw;
++            std::memcpy(&raw, index_bytes + (i << 1), 2);
++            uint16_t swapped = uint16_t((raw >> 8) | (raw << 8));
++            max_index = std::max(max_index, uint32_t(swapped));
++          }
++          REXGPU_INFO(
++              "VStream dump: VS ucode {:016X} index buffer 0x{:08X} count {} max index {}",
++              vertex_shader->ucode_data_hash(), index_base, index_count, max_index);
++        }
++      }
++    }
++  }
++
+   // Draw.
+   if (primitive_processing_result.index_buffer_type ==
+       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+@@ -2719,8 +3077,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       }
+       if (memexport_total_size != 0) {
+         if (REXCVAR_GET(readback_memexport_fast)) {
++          if (REXCVAR_GET(memwatch_debug_log)) {
++            REXGPU_INFO("MemExport readback: fast path, {} bytes total", memexport_total_size);
++          }
+           IssueDraw_MemexportReadbackFastPath(memexport_total_size);
+         } else {
++          if (REXCVAR_GET(memwatch_debug_log)) {
++            REXGPU_INFO("MemExport readback: full sync path, {} bytes total",
++                        memexport_total_size);
++          }
+           IssueDraw_MemexportReadbackFullPath(memexport_total_size);
+         }
+       }
+@@ -2765,6 +3130,15 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
+ 
+   const uint8_t* readback_bytes = reinterpret_cast<const uint8_t*>(readback_mapping);
+   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
++    if (REXCVAR_GET(memwatch_debug_log)) {
++      const uint32_t* dwords = reinterpret_cast<const uint32_t*>(readback_bytes);
++      uint32_t dword_count = std::min<uint32_t>(memexport_range.size_bytes >> 2, 4);
++      REXGPU_INFO("MemExport readback full sync: range 0x{:08X} first dwords {:08X} {:08X} "
++                  "{:08X} {:08X}",
++                  memexport_range.base_address_dwords << 2, dwords[0],
++                  dword_count > 1 ? dwords[1] : 0, dword_count > 2 ? dwords[2] : 0,
++                  dword_count > 3 ? dwords[3] : 0);
++    }
+     std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                 readback_bytes, memexport_range.size_bytes);
+     readback_bytes += memexport_range.size_bytes;
+@@ -2855,6 +3229,12 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+                              readback.submission_written[read_index] &&
+                              readback.submission_written[read_index] <= submission_completed_;
+   if (!previous_slot_ready) {
++    if (REXCVAR_GET(memwatch_debug_log)) {
++      REXGPU_INFO(
++          "MemExport readback fast: previous slot not ready, falling back to full sync "
++          "(key {:016X}, frame {}, submission {})",
++          readback_key, frame_current_, submission_current_);
++    }
+     IssueDraw_MemexportReadbackFullPath(total_size);
+     readback.current_index = read_index;
+     return true;
+@@ -2862,6 +3242,15 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+ 
+   const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapped_data[read_index]);
+   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
++    if (REXCVAR_GET(memwatch_debug_log)) {
++      const uint32_t* dwords = reinterpret_cast<const uint32_t*>(readback_bytes);
++      uint32_t dword_count = std::min<uint32_t>(memexport_range.size_bytes >> 2, 4);
++      REXGPU_INFO("MemExport readback fast (1 frame stale): range 0x{:08X} first dwords {:08X} "
++                  "{:08X} {:08X} {:08X}",
++                  memexport_range.base_address_dwords << 2, dwords[0],
++                  dword_count > 1 ? dwords[1] : 0, dword_count > 2 ? dwords[2] : 0,
++                  dword_count > 3 ? dwords[3] : 0);
++    }
+     std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                 readback_bytes, memexport_range.size_bytes);
+     readback_bytes += memexport_range.size_bytes;
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..d2f1cda 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -16,7 +16,9 @@
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
++#include <rex/graphics/flags.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
+@@ -272,6 +274,36 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   MakeRangeValid(start, length, true);
+ }
+ 
++void SharedMemory::InvalidateUploadedRange(uint32_t start, uint32_t length) {
++  if (length == 0 || start >= kBufferSize) {
++    return;
++  }
++  length = std::min(length, kBufferSize - start);
++  uint32_t end = start + length - 1;
++  uint32_t page_first = start >> page_size_log2_;
++  uint32_t page_last = end >> page_size_log2_;
++  uint32_t block_first = page_first >> 6;
++  uint32_t block_last = page_last >> 6;
++
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    for (uint32_t i = block_first; i <= block_last; ++i) {
++      uint64_t invalidate_bits = UINT64_MAX;
++      if (i == block_first) {
++        invalidate_bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
++      }
++      if (i == block_last && (page_last & 63) != 63) {
++        invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++      }
++      // Don't touch pages holding GPU-written data (render targets, memexport
++      // destinations) - invalidating those would make the next upload overwrite
++      // GPU results with CPU data.
++      invalidate_bits &= ~system_page_flags_valid_and_gpu_written_[i];
++      system_page_flags_valid_[i] &= ~invalidate_bits;
++    }
++  }
++}
++
+ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                                     uint32_t length_allocations) {
+   assert_always(
+@@ -461,6 +493,22 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
+                     uint32_t(upload_ranges_.size()));
+ 
++  if (REXCVAR_GET(memwatch_debug_log)) {
++    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
++      if (range.second <= 512) {
++        REXGPU_INFO("SharedMemory request: 0x{:08X} ({} bytes)", range.first, range.second);
++      }
++    }
++    for (const std::pair<uint32_t, uint32_t>& upload_range : upload_ranges_) {
++      if (upload_range.second <= 64) {
++        REXGPU_INFO("SharedMemory upload: pages {}..{} (0x{:08X}, {} bytes)",
++                    upload_range.first, upload_range.first + upload_range.second - 1,
++                    upload_range.first << page_size_log2_,
++                    upload_range.second << page_size_log2_);
++      }
++    }
++  }
++
+   if (upload_ranges_.empty()) {
+     return true;
+   }
+@@ -516,6 +564,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+     }
+   }
+ 
++  bool log_invalidate = REXCVAR_GET(memwatch_debug_log) && length <= 65536;
++  uint64_t gpu_written_before = 0;
++  if (log_invalidate) {
++    for (uint32_t i = block_first; i <= block_last; ++i) {
++      gpu_written_before |= system_page_flags_valid_and_gpu_written_[i];
++    }
++  }
++
+   for (uint32_t i = block_first; i <= block_last; ++i) {
+     uint64_t invalidate_bits = UINT64_MAX;
+     if (i == block_first) {
+@@ -528,6 +584,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
+   }
+ 
++  if (log_invalidate) {
++    REXGPU_INFO(
++        "SharedMemory invalidate: CPU wrote 0x{:08X} ({} bytes, exact {}) -> pages {}..{} "
++        "(gpu-written nearby: {})",
++        physical_address_start, length, exact_range ? "yes" : "no", page_first, page_last,
++        gpu_written_before != 0 ? "yes" : "no");
++  }
++
+   FireWatches(page_first, page_last, false);
+ 
+   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e..a2d58d0 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -28,6 +28,11 @@
+ 
+ REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
+ 
++REXCVAR_DEFINE_BOOL(memexport_debug_log, false, "GPU",
++                    "Log shader memexport stream constants, exported ranges and CPU readback "
++                    "(debug diagnosis of skinned-mesh corruption)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
+                     "Fill half pixel offset during resolution scale resolve");
+ 
+@@ -629,9 +634,18 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
+   uint32_t float_constants_base = shader.type() == xenos::ShaderType::kVertex
+                                       ? regs.Get<reg::SQ_VS_CONST>().base
+                                       : regs.Get<reg::SQ_PS_CONST>().base;
++  bool log_debug = REXCVAR_GET(memexport_debug_log);
+   for (uint32_t constant_index : shader.memexport_stream_constants()) {
+     xenos::xe_gpu_memexport_stream_t stream =
+         regs.GetMemExportStream(float_constants_base + constant_index);
++    if (log_debug) {
++      REXGPU_INFO(
++          "MemExport range scan: {} ucode {:016X} constant {} (float constant {}) dwords "
++          "{:08X} {:08X} {:08X} {:08X}",
++          shader.type() == xenos::ShaderType::kVertex ? "VS" : "PS", shader.ucode_data_hash(),
++          constant_index, float_constants_base + constant_index, stream.dword_0, stream.dword_1,
++          stream.dword_2, stream.dword_3);
++    }
+     // Safety checks for stream constants potentially not set up if the export
+     // isn't done on the control flow path taken by the shader (not checking the
+     // Y component because the index is more likely to be constructed
+@@ -640,6 +654,12 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
+     // IPR2015-00325 sequencer specification.
+     if (stream.const_0x1 != 0x1 || stream.const_0x4b0 != 0x4B0 || stream.const_0x96 != 0x96 ||
+         !stream.index_count) {
++      if (log_debug) {
++        REXGPU_INFO(
++            "MemExport range scan: {} ucode {:016X} constant {} SKIPPED (magic checks failed)",
++            shader.type() == xenos::ShaderType::kVertex ? "VS" : "PS", shader.ucode_data_hash(),
++            constant_index);
++      }
+       continue;
+     }
+     const FormatInfo& format_info = *FormatInfo::Get(xenos::TextureFormat(stream.format));
+@@ -680,6 +700,14 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
+     if (!range_reused) {
+       ranges_out.emplace_back(uint32_t(stream.base_address), stream_size_bytes);
+     }
++    if (log_debug) {
++      REXGPU_INFO(
++          "MemExport range scan: {} ucode {:016X} constant {} range 0x{:08X} ({} bytes), "
++          "format {}, index count {}",
++          shader.type() == xenos::ShaderType::kVertex ? "VS" : "PS", shader.ucode_data_hash(),
++          constant_index, uint32_t(stream.base_address) << 2, stream_size_bytes,
++          format_info.name, uint32_t(stream.index_count));
++    }
+   }
+ }
+ 
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..6d7a54e 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -41,6 +41,11 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
+ 
+ REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
+ 
++REXCVAR_DEFINE_BOOL(memwatch_debug_log, false, "Memory",
++                    "Log guest access violations reaching the memory subsystem (debug "
++                    "diagnosis of write-watch based GPU invalidation)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::memory {
+ 
+ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
+@@ -181,6 +186,11 @@ bool Memory::Initialize() {
+               reinterpret_cast<uintptr_t>(virtual_membase_),
+               reinterpret_cast<uintptr_t>(physical_membase_));
+ 
++  // Write-watch notification bits for the identity mapping of physical memory
++  // (see the member comment in the header).
++  identity_window_notify_pages_.assign(
++      size_t(1) << (kIdentityWindowSizeLog2 - kIdentityPageSizeLog2 - 6), 0);
++
+   // Prepare virtual heaps.
+   heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
+                               0x40000000, 4096);
+@@ -533,19 +543,75 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
+ 
+ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+                                      void* host_address, bool is_write) {
++  const size_t host_address_value = reinterpret_cast<size_t>(host_address);
++
++  // Write faults in the identity mapping of the first 512 MB of physical
++  // memory (guest virtual address equals the physical one in the 0x00000000
++  // virtual heap): invalidate the page for the watch callbacks (the shared
++  // memory works with physical addresses, which the identity preserves),
++  // unprotect the page, and resume. The global critical region is held for the
++  // whole handling, so a concurrent fault on the same page either sees the
++  // notify bit still set (first fault) or finds the page already unprotected
++  // via the recovery below (racing fault).
++  constexpr uint32_t kIdentityWindowSize = uint32_t(1) << kIdentityWindowSizeLog2;
++  constexpr uint32_t kIdentityPageSize = uint32_t(1) << kIdentityPageSizeLog2;
++  if (host_address_value >= reinterpret_cast<size_t>(virtual_membase_) &&
++      host_address_value < reinterpret_cast<size_t>(virtual_membase_) + kIdentityWindowSize) {
++    uint32_t guest_physical =
++        uint32_t(host_address_value - reinterpret_cast<size_t>(virtual_membase_));
++    uint32_t page = guest_physical >> kIdentityPageSizeLog2;
++    bool watched = false;
++    {
++      uint64_t& notify_word = identity_window_notify_pages_[page >> 6];
++      uint64_t notify_bit = uint64_t(1) << (page & 63);
++      if (notify_word & notify_bit) {
++        notify_word &= ~notify_bit;
++        watched = true;
++      }
++    }
++    if (watched && is_write) {
++      if (REXCVAR_GET(memwatch_debug_log)) {
++        REXSYS_INFO("AccessViolation: identity window, guest physical 0x{:08X}, write {}",
++                    guest_physical, is_write ? "yes" : "no");
++      }
++      // Will be rounded to page boundaries internally, and a single page cannot
++      // cross a boundary.
++      uint32_t page_physical = page << kIdentityPageSizeLog2;
++      for (auto invalidation_callback : physical_memory_invalidation_callbacks_) {
++        invalidation_callback->first(invalidation_callback->second, page_physical,
++                                     kIdentityPageSize, true);
++      }
++      rex::memory::Protect(host_address, kIdentityPageSize, rex::memory::PageAccess::kReadWrite);
++      return true;
++    }
++    // Not watched: fall through to the regular handling, which will report the
++    // violation against the heap the guest address belongs to (and its
++    // recovery path can still heal stale protection, which is what a racing
++    // fault on a just-invalidated page needs).
++  }
++
+   // Access via physical_membase_ is special, when need to bypass everything
+   // (for instance, for a data provider to actually write the data) so only
+   // triggering callbacks on virtual memory regions.
+-  if (reinterpret_cast<size_t>(host_address) < reinterpret_cast<size_t>(virtual_membase_) ||
+-      reinterpret_cast<size_t>(host_address) >= reinterpret_cast<size_t>(physical_membase_)) {
++  if (host_address_value < reinterpret_cast<size_t>(virtual_membase_) ||
++      host_address_value >= reinterpret_cast<size_t>(physical_membase_)) {
++    if (REXCVAR_GET(memwatch_debug_log)) {
++      REXSYS_INFO(
++          "AccessViolation: OUTSIDE guest virtual views, host 0x{:016X}, write {}",
++          host_address_value, is_write ? "yes" : "no");
++    }
+     return false;
+   }
+   uint32_t virtual_address = HostToGuestVirtual(host_address);
++  if (REXCVAR_GET(memwatch_debug_log)) {
++    REXSYS_INFO("AccessViolation: guest 0x{:08X} (host 0x{:016X}), write {}",
++                virtual_address, host_address_value, is_write ? "yes" : "no");
++  }
+   BaseHeap* heap = LookupHeap(virtual_address);
+   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+     REXSYS_ERROR(
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+-        is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
++        is_write ? "write" : "read", virtual_address, host_address_value,
+         rex::thread::current_thread_id());
+     return false;
+   }
+@@ -688,6 +754,63 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint
+                                          enable_invalidation_notifications, enable_data_providers);
+   heaps_.vE0000000.EnableAccessCallbacks(physical_address, length,
+                                          enable_invalidation_notifications, enable_data_providers);
++
++  // The alias heaps above are backed by different host views than the identity
++  // mapping of physical memory in the 0x00000000 virtual heap, where guest
++  // virtual address equals the physical address. Games write GPU-visible data
++  // through that window directly (TDU 2 streams its skinned-mesh bone palettes
++  // this way), so it must be write-protected as well - otherwise those writes
++  // never fault, the shared memory never invalidates, and the GPU keeps
++  // sampling the data from the first upload of each page. Host services (such
++  // as resolve readback) access physical memory via physical_membase_, which
++  // stays unprotected, so they keep bypassing the watches by design.
++  constexpr uint32_t kIdentityWindowSize = uint32_t(1) << kIdentityWindowSizeLog2;
++  constexpr uint32_t kIdentityPageSize = uint32_t(1) << kIdentityPageSizeLog2;
++  if (!enable_invalidation_notifications || enable_data_providers || !length) {
++    return;
++  }
++  if (physical_address >= kIdentityWindowSize) {
++    return;
++  }
++  uint32_t identity_length = std::min(length, kIdentityWindowSize - physical_address);
++  uint32_t page_first = physical_address >> kIdentityPageSizeLog2;
++  uint32_t page_last = (physical_address + identity_length - 1) >> kIdentityPageSizeLog2;
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      identity_window_notify_pages_[page >> 6] |= uint64_t(1) << (page & 63);
++    }
++  }
++  // Protect writable, committed pages in the identity view. Protection is
++  // applied per contiguous run of pages the physical heap reports as writable;
++  // VirtualProtect of a run containing an uncommitted page would fail
++  // wholesale, so runs are broken at unwritable pages.
++  uint32_t run_first = UINT32_MAX;
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    bool protect_page = false;
++    uint32_t page_protect = 0;
++    if (heaps_.physical.QueryProtect(page << kIdentityPageSizeLog2, &page_protect) &&
++        (page_protect & (memory::kMemoryProtectWrite | memory::kMemoryProtectWriteCombine))) {
++      protect_page = true;
++    }
++    if (protect_page) {
++      if (run_first == UINT32_MAX) {
++        run_first = page;
++      }
++    } else {
++      if (run_first != UINT32_MAX) {
++        rex::memory::Protect(virtual_membase_ + (run_first << kIdentityPageSizeLog2),
++                             (page - run_first) << kIdentityPageSizeLog2,
++                             rex::memory::PageAccess::kReadOnly);
++        run_first = UINT32_MAX;
++      }
++    }
++  }
++  if (run_first != UINT32_MAX) {
++    rex::memory::Protect(virtual_membase_ + (run_first << kIdentityPageSizeLog2),
++                         (page_last + 1 - run_first) << kIdentityPageSizeLog2,
++                         rex::memory::PageAccess::kReadOnly);
++  }
+ }
+ 
+ uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
+@@ -2159,16 +2282,26 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+       }
+     } else {
+       if (protect_system_page_first != UINT32_MAX) {
+-        rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
+-                             (i - protect_system_page_first) * system_page_size_, protect_access);
++        if (!rex::memory::Protect(
++                protect_base + protect_system_page_first * system_page_size_,
++                (i - protect_system_page_first) * system_page_size_, protect_access)) {
++          REXSYS_ERROR(
++              "EnableAccessCallbacks: Protect FAILED for pages {}..{} of heap base 0x{:016X}",
++              protect_system_page_first, i - 1, reinterpret_cast<uintptr_t>(protect_base));
++        }
+         protect_system_page_first = UINT32_MAX;
+       }
+     }
+   }
+   if (protect_system_page_first != UINT32_MAX) {
+-    rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
+-                         (system_page_last + 1 - protect_system_page_first) * system_page_size_,
+-                         protect_access);
++    if (!rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
++                              (system_page_last + 1 - protect_system_page_first) *
++                                  system_page_size_,
++                              protect_access)) {
++      REXSYS_ERROR(
++          "EnableAccessCallbacks: Protect FAILED for pages {}..{} of heap base 0x{:016X}",
++          protect_system_page_first, system_page_last, reinterpret_cast<uintptr_t>(protect_base));
++    }
+   }
+ }
+ 

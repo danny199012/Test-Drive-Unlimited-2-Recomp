@@ -28,34 +28,34 @@ TDU2/
 # than vendoring it into this repository.
 rexglue/
 
-# SDK source tree (cloned for debugging; use the patch file instead)
-rexglue-sdk/
-
-# --- Debugging captures and binary dumps --------------------------------------
-# Real console RAM dumps (up to 480 MB each)
-Real\ Dumps/
-# RenderDoc captures (~350 MB each)
-TDU2\ Renderdoc/
-# Extracted shader/vertex dump files
-shader_dumps/
-vertex_dumps/
-# Automated screenshot captures (many MB each, generated per test run)
-_intro_*.jpg
-_intro_*.png
-_crop_*.png
-_shot_*.jpg
-_screenshot_small.png
-_verify_*.png
-avatar_preview.png
-# Extracted/embedded images
-thumb.jpg
-# Build output captured to files
-_build_err.txt
-_build_out.txt
-# Tmp/scratch files
-_pending_restore.txt
-_paths.txt
-_strings_out.txt
-_perf_build.log
-_sdk_build.log
-_sdk_cfg.log
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+__pycache__/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）
