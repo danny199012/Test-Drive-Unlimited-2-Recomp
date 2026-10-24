@@ -82,6 +82,20 @@ profile_name = "ReXGlue Player"
 profile_xuid = 2533274793222573
 profile_signed_in = true
 
+# --- Marketplace DLC ----------------------------------------------------------
+#
+# Folder of retail STFS DLC packages (LIVE/CON/PIRS files, content type
+# 00000002). At startup every package not already installed is extracted into
+# the user data root (Documents/tdu2/0000000000000000/<title>/00000002/) and
+# its license bits written alongside, so the game enumerates it as owned.
+# Forward slashes avoid TOML escaping; packages install smallest-first.
+# tdu2_dlc_root = "E:/Games/TDU2 DLC/49470804/00000002"
+#
+# Belt-and-braces for license checks that bypass the per-package .header bits
+# (XamContentGetLicenseMask returns this value directly). 16 of the 17 TDU2
+# packs carry a purchased-license entry; the free Mandatory pack has none.
+# license_mask = 4294967295
+
 # --- Intro-scene skinned-mesh corruption ------------------------------------
 #
 # Symptom: the character in the intro / character-select scene renders as

@@ -14,6 +14,7 @@ include(generated/rexglue.cmake)
 set(TDU2_SOURCES
     src/main.cpp
     src/tdu2_config.cpp
+    src/tdu2_dlc.cpp
     src/tdu2_menu.cpp
     src/tdu2_profile.cpp
 )

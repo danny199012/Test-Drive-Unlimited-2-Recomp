@@ -22,6 +22,7 @@
 
 // Included (not forward-declared): OnPostSetup constructs Tdu2MenuDialog with
 // std::make_unique, which needs the complete type.
+#include "tdu2_dlc.h"
 #include "tdu2_menu.h"
 #include "tdu2_profile.h"
 
@@ -236,6 +237,12 @@ class Tdu2App : public rex::ReXApp {
   // is loaded by the guest a couple of seconds later, so hooking only once from
   // OnPreLaunchModule reaches just the launcher. This runs the retrying install
   // on its own thread instead, and joins it on shutdown.
+  //
+  // The same thread also extracts any marketplace DLC packages found in
+  // tdu2_dlc_root (see tdu2_dlc.h): title_id() reads the executable module's
+  // XEX header, which is already registered at this point, so the packages
+  // land under the right title. Extraction is host-side file IO that can take
+  // a few seconds on first run, hence off the UI thread.
   void OnPreLaunchModule() override {
     if (runtime() == nullptr) {
       return;
@@ -243,6 +250,7 @@ class Tdu2App : public rex::ReXApp {
     profile_hook_thread_ = std::thread([this] {
       tdu2::InstallProfileHooksWithRetry(runtime()->function_dispatcher(),
                                          std::chrono::milliseconds(500), 6);
+      tdu2::InstallDlcPackages(runtime()->kernel_state());
     });
   }
 
