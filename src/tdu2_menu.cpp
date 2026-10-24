@@ -237,6 +237,24 @@ void Tdu2MenuDialog::DrawDisplayTab() {
 }
 
 void Tdu2MenuDialog::DrawGraphicsTab() {
+  // tdu2_fov_boost is defined by the FOV hook in the game DLL, so it only
+  // exists once the guest has loaded that module. It counts degrees on top of
+  // the default chase camera's 45 degree vertical FOV.
+  constexpr int kChaseCameraFov = 45;
+  RowLabel("Field of view", {"tdu2_fov_boost"});
+  if (rex::cvar::GetFlagInfo("tdu2_fov_boost") != nullptr) {
+    int fov = kChaseCameraFov + GetInt("tdu2_fov_boost", 0);
+    if (ImGui::SliderInt("##tdu2_fov_boost", &fov, kChaseCameraFov, kChaseCameraFov + 40,
+                         fov == kChaseCameraFov ? "45\xC2\xB0 (default)" : "%d\xC2\xB0")) {
+      Apply({{"tdu2_fov_boost", std::to_string(fov - kChaseCameraFov)}});
+    }
+    RowHelp("Vertical field of view of the chase camera; the in-car view and cutscenes "
+            "widen in proportion. Applies immediately.");
+  } else {
+    ImGui::TextDisabled("Available once the game has loaded");
+    RowHelp(nullptr);
+  }
+
   static constexpr Choice kResolutionScales[] = {
       {"1x (native)", "1"},
       {"2x", "2"},

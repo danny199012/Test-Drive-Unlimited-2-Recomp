@@ -24,6 +24,13 @@ else()
     add_executable(tdu2 ${TDU2_SOURCES})
 endif()
 
+# Hooks over generated game functions must live in the game DLL: generated
+# functions are weak aliases of their __imp__ originals, overridable only
+# within the same linked image.
+target_sources(tdu2_TestDrive2_DLL PRIVATE
+    src/hooks/tdu2_fov.cpp
+)
+
 # Stage the Xenos GPU emulation plugin next to the exe. rexglue picks the
 # per-configuration variant (rexgpu-xenosd.dll for Debug, rexgpu-xenos.dll
 # for Release). Without this the game has no GPU emulation at all.
