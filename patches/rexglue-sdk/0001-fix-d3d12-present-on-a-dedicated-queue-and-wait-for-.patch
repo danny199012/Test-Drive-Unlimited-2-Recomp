@@ -1,0 +1,304 @@
+From 97b4ea316c14d33e813ae31c9c30b07618f3854f Mon Sep 17 00:00:00 2001
+From: Daniel Robson <danny19901@gmail.com>
+Date: Sat, 24 Oct 2026 14:30:05 +0100
+Subject: [PATCH 1/4] fix(d3d12): present on a dedicated queue and wait for a
+ free back buffer
+
+With independent flip (notably the Windows 11 hardware flip queue), Present
+can block until a vertical blank while holding the D3D12 queue lock, and a
+paint into a back buffer still on screen stalls the GPU until the next flip.
+The presenter shared the provider's direct queue with GPU emulation, so every
+submission and fence signal of the emulator, including the synchronous waits
+of resolve readbacks, queued up behind the flip. Titles doing many readbacks
+per frame dropped below 1 FPS whenever the window was focused and not composed
+by DWM, and ran at full speed when covered, previewed in the taskbar or
+captured.
+
+- Paint and present on a presenter-owned direct queue. The present queue
+  waits for the refresher fence before reading a guest output texture, and
+  the direct queue waits for the last paint that read a mailbox slot before
+  refreshing it again.
+- Create the swap chain with a frame latency waitable object (maximum
+  latency 1) and wait on it before painting, so the paint never waits on the
+  GPU for a back buffer.
+
+Measured in Test Drive Unlimited 2: 0.3 -> ~25 FPS in a heavy scene with the
+window focused.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ui/d3d12/d3d12_presenter.h        | 28 ++++++
+ .../rex/ui/d3d12/d3d12_submission_tracker.h   |  3 +
+ src/ui/d3d12/d3d12_presenter.cpp              | 85 ++++++++++++++++---
+ 3 files changed, 102 insertions(+), 14 deletions(-)
+
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 83d09f7..875b671 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <memory>
+ #include <utility>
+ 
+@@ -251,6 +252,14 @@ class D3D12Presenter final : public Presenter {
+     uint32_t swap_chain_width = 0;
+     uint32_t swap_chain_height = 0;
+     bool swap_chain_allows_tearing = false;
++    // Creation flags, which ResizeBuffers must keep (the frame latency
++    // waitable object flag can't be toggled there).
++    UINT swap_chain_flags = 0;
++    // Signaled when the swap chain can take another frame without the paint
++    // having to wait on the GPU for a back buffer that's still on screen. Such
++    // a GPU wait, until the next vertical blank with independent flip, also
++    // delays the GPU emulation queue, so painting waits for it on the CPU.
++    HANDLE swap_chain_frame_latency_waitable_object = nullptr;
+     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
+     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
+   };
+@@ -302,6 +311,25 @@ class D3D12Presenter final : public Presenter {
+   // guest_output_resources_).
+   D3D12SubmissionTracker guest_output_resource_refresher_submission_tracker_;
+ 
++  // Painting and presentation use a queue of their own rather than the
++  // provider's direct queue that GPU emulation submits to. With independent
++  // flip (notably the Windows 11 hardware flip queue), Present may block inside
++  // the runtime until a vertical blank while holding the queue lock. On a
++  // shared queue, every ExecuteCommandLists and fence signal of GPU emulation,
++  // including the synchronous waits of readbacks, would stall behind it, which
++  // dropped some titles below 1 FPS whenever the window was not composed by
++  // DWM.
++  Microsoft::WRL::ComPtr<ID3D12CommandQueue> present_queue_;
++  // Cross-queue synchronization of the guest output textures, indexed by the
++  // mailbox index.
++  // The refresher fence value the present queue must wait for before reading
++  // the texture, or 0 if the signal wasn't enqueued. Written by the guest
++  // output thread before publishing the texture in the mailbox.
++  std::array<UINT64, kGuestOutputMailboxSize> guest_output_refreshed_fence_values_{};
++  // The paint fence value of the last enqueued paint reading the texture, which
++  // the direct queue must wait for before the texture is refreshed again.
++  std::array<std::atomic<UINT64>, kGuestOutputMailboxSize> guest_output_painted_fence_values_{};
++
+   // UI submission tracker with the submission index that can be given to UI
+   // drawers (accessible from the UI thread only, at any time).
+   D3D12SubmissionTracker ui_submission_tracker_;
+diff --git a/include/rex/ui/d3d12/d3d12_submission_tracker.h b/include/rex/ui/d3d12/d3d12_submission_tracker.h
+index 2ca1704..4e67fc1 100644
+--- a/include/rex/ui/d3d12/d3d12_submission_tracker.h
++++ b/include/rex/ui/d3d12/d3d12_submission_tracker.h
+@@ -53,6 +53,9 @@ class D3D12SubmissionTracker {
+     // but destruction can be simplified.
+     return fence_ ? fence_->GetCompletedValue() : (GetCurrentSubmission() - 1);
+   }
++  // For making another queue wait for a submission index whose signal has
++  // been enqueued successfully (NextSubmission returned true for it).
++  ID3D12Fence* GetFence() const { return fence_.Get(); }
+ 
+   // Returns whether the expected GPU signal has actually been reached (rather
+   // than some fallback condition) for cases when stronger completeness
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..5dded8f 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -354,16 +354,16 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+       return SurfacePaintConnectResult::kSuccessUnchanged;
+     }
+     paint_context_.AwaitSwapChainUsageCompletion();
+-    // Using the current swap_chain_allows_tearing_ value that's consistent with
+-    // the creation of the swap chain because ResizeBuffers can't toggle the
+-    // tearing flag.
++    // Using the current swap_chain_flags value that's consistent with the
++    // creation of the swap chain because ResizeBuffers can't toggle the
++    // tearing and the frame latency waitable object flags.
+     for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref :
+          paint_context_.swap_chain_buffers) {
+       swap_chain_buffer_ref.Reset();
+     }
+     bool swap_chain_resized = SUCCEEDED(paint_context_.swap_chain->ResizeBuffers(
+         0, UINT(new_swap_chain_width), UINT(new_swap_chain_height), DXGI_FORMAT_UNKNOWN,
+-        paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
++        paint_context_.swap_chain_flags));
+     if (swap_chain_resized) {
+       for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
+         if (FAILED(paint_context_.swap_chain->GetBuffer(
+@@ -407,21 +407,21 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+             : DXGI_SCALING_STRETCH;
+     swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+     swap_chain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+-    swap_chain_desc.Flags = 0;
++    swap_chain_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+     if (REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_) {
+       // Allow tearing in borderless fullscreen to support variable refresh
+       // rate.
+       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+     }
+     IDXGIFactory2* dxgi_factory = provider_.GetDXGIFactory();
+-    ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
+     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
+     switch (surface_type) {
+ #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
+       case Surface::kTypeIndex_Win32Hwnd: {
+         HWND surface_hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
+         if (FAILED(dxgi_factory->CreateSwapChainForHwnd(
+-                direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
++                present_queue_.Get(), surface_hwnd, &swap_chain_desc, nullptr, nullptr,
++                &swap_chain_1))) {
+           REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
+           return SurfacePaintConnectResult::kFailure;
+         }
+@@ -450,6 +450,13 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+     paint_context_.swap_chain_height = new_swap_chain_height;
+     paint_context_.swap_chain_allows_tearing =
+         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
++    paint_context_.swap_chain_flags = swap_chain_desc.Flags;
++    // One queued frame: once the previous present has been flipped, the back
++    // buffer to paint is not on screen anymore.
++    if (SUCCEEDED(paint_context_.swap_chain->SetMaximumFrameLatency(1))) {
++      paint_context_.swap_chain_frame_latency_waitable_object =
++          paint_context_.swap_chain->GetFrameLatencyWaitableObject();
++    }
+     for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
+       if (FAILED(paint_context_.swap_chain->GetBuffer(
+               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
+@@ -528,6 +535,16 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
+       return false;
+     }
+   }
++  // The mailbox only guarantees that the texture isn't acquired for painting
++  // anymore, but painting happens on a different queue, so the last paint
++  // reading it may still be pending on the GPU. The refresher submits its
++  // commands after this, so the wait is ordered before them.
++  UINT64 painted_fence_value =
++      guest_output_painted_fence_values_[mailbox_index].load(std::memory_order_acquire);
++  if (painted_fence_value) {
++    provider_.GetDirectQueue()->Wait(paint_context_.paint_submission_tracker.GetFence(),
++                                     painted_fence_value);
++  }
+   D3D12GuestOutputRefreshContext context(is_8bpc_out_ref, guest_output_resource_ref.second.Get());
+   bool refresher_succeeded = refresher(context);
+   // Even if the refresher has returned false, it still might have submitted
+@@ -536,7 +553,10 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
+   // than to destroy the resource while it's still in use.
+   guest_output_resource_ref.first =
+       guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
+-  guest_output_resource_refresher_submission_tracker_.NextSubmission();
++  guest_output_refreshed_fence_values_[mailbox_index] =
++      guest_output_resource_refresher_submission_tracker_.NextSubmission()
++          ? guest_output_resource_ref.first
++          : 0;
+   return refresher_succeeded;
+ }
+ 
+@@ -548,13 +568,25 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
+   for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
+     swap_chain_buffer_ref.Reset();
+   }
++  if (swap_chain_frame_latency_waitable_object) {
++    CloseHandle(swap_chain_frame_latency_waitable_object);
++    swap_chain_frame_latency_waitable_object = nullptr;
++  }
+   swap_chain.Reset();
++  swap_chain_flags = 0;
+   swap_chain_allows_tearing = false;
+   swap_chain_height = 0;
+   swap_chain_width = 0;
+ }
+ 
+ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
++  // Wait until a back buffer is free (normally up to one vertical blank). The
++  // timeout only guards against the object never being signaled, painting
++  // anyway is no worse than not having the object at all.
++  if (paint_context_.swap_chain_frame_latency_waitable_object) {
++    WaitForSingleObjectEx(paint_context_.swap_chain_frame_latency_waitable_object, 100, FALSE);
++  }
++
+   // Begin the command list with the command allocator not currently potentially
+   // used on the GPU.
+   UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
+@@ -588,12 +620,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   GuestOutputProperties guest_output_properties;
+   GuestOutputPaintConfig guest_output_paint_config;
+   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
++  uint32_t guest_output_mailbox_index;
++  UINT64 guest_output_refreshed_fence_value = 0;
++  bool guest_output_painted = false;
+   {
+-    uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
++      guest_output_refreshed_fence_value =
++          guest_output_refreshed_fence_values_[guest_output_mailbox_index];
+     }
+     // Incremented the reference count of the guest output resource - safe to
+     // leave the consumer critical section now as everything here either will be
+@@ -776,6 +812,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+       }
+ 
+       if (guest_output_flow.effect_count) {
++        guest_output_painted = true;
+         paint_context_.guest_output_resource_paint_refs[guest_output_resource_paint_ref_index]
+             .first = current_paint_submission;
+         if (guest_output_flow.effect_count > 1) {
+@@ -1142,11 +1179,18 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // Execute and present.
+   command_list->Close();
+   ID3D12CommandList* execute_command_list = command_list;
+-  provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
++  if (guest_output_painted && guest_output_refreshed_fence_value) {
++    present_queue_->Wait(guest_output_resource_refresher_submission_tracker_.GetFence(),
++                         guest_output_refreshed_fence_value);
++  }
++  present_queue_->ExecuteCommandLists(1, &execute_command_list);
+   if (execute_ui_drawers) {
+     ui_submission_tracker_.NextSubmission();
+   }
+-  paint_context_.paint_submission_tracker.NextSubmission();
++  if (paint_context_.paint_submission_tracker.NextSubmission() && guest_output_painted) {
++    guest_output_painted_fence_values_[guest_output_mailbox_index].store(
++        current_paint_submission, std::memory_order_release);
++  }
+   // Present as soon as possible, without waiting for vsync (the host refresh
+   // rate may be something like 144 Hz, which is not a multiple of the common
+   // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
+@@ -1443,9 +1487,22 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+ 
+   ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
+ 
++  // Painting and presentation queue, separate from GPU emulation (see the
++  // declaration of present_queue_).
++  D3D12_COMMAND_QUEUE_DESC present_queue_desc;
++  present_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++  present_queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
++  present_queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
++  present_queue_desc.NodeMask = 0;
++  if (FAILED(device->CreateCommandQueue(&present_queue_desc, IID_PPV_ARGS(&present_queue_)))) {
++    REXLOG_ERROR("D3D12Presenter: Failed to create the presentation command queue");
++    return false;
++  }
++  ID3D12CommandQueue* present_queue = present_queue_.Get();
++
+   // Paint submission trackers.
+-  if (!paint_context_.paint_submission_tracker.Initialize(device, direct_queue) ||
+-      !paint_context_.present_submission_tracker.Initialize(device, direct_queue)) {
++  if (!paint_context_.paint_submission_tracker.Initialize(device, present_queue) ||
++      !paint_context_.present_submission_tracker.Initialize(device, present_queue)) {
+     return false;
+   }
+ 
+@@ -1505,7 +1562,7 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+     return false;
+   }
+ 
+-  if (!ui_submission_tracker_.Initialize(device, direct_queue)) {
++  if (!ui_submission_tracker_.Initialize(device, present_queue)) {
+     return false;
+   }
+ 
+-- 
+2.53.0.windows.2
+

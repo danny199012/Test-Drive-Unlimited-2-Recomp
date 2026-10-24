@@ -1,0 +1,460 @@
+From 5b4953bebee674dff661eb5b35bb81a8ee63d423 Mon Sep 17 00:00:00 2001
+From: Daniel Robson <danny19901@gmail.com>
+Date: Sat, 24 Oct 2026 15:58:42 +0100
+Subject: [PATCH 3/4] feat(ui): gamepad navigation for ImGui overlays and app
+ input blocking
+
+SDL gamepad button and axis events reached the windowed app context and
+were dropped, so overlays could only be used with a keyboard and mouse.
+
+- Add GamepadEvent and WindowInputListener::OnGamepadEvent. The SDL app
+  context forwards SDL_EVENT_GAMEPAD_* to every window (gamepads are not
+  tied to one), and WindowSDL translates buttons and axes.
+- ImGuiDrawer maps them onto ImGui's gamepad keys (with a stick dead zone)
+  and enables ImGuiConfigFlags_NavEnableGamepad, so every dialog, including
+  the F4 settings editor, can be driven with a controller.
+- Add ReXApp::IsGuestInputBlocked, consulted by the input active callback,
+  so an app's own overlay can keep the guest from seeing the controller
+  while it is open. The SDK only knew about its own overlays before.
+
+Guest input is unaffected: the input drivers still read gamepads through
+their own event watch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/rex_app.h               |  5 ++
+ include/rex/ui/imgui_drawer.h       |  1 +
+ include/rex/ui/ui_event.h           | 67 ++++++++++++++++++++++
+ include/rex/ui/window.h             |  2 +
+ include/rex/ui/window_listener.h    |  1 +
+ include/rex/ui/window_sdl.h         |  1 +
+ src/ui/imgui_drawer.cpp             | 89 +++++++++++++++++++++++++++++
+ src/ui/rex_app.cpp                  |  3 +
+ src/ui/window.cpp                   | 12 ++++
+ src/ui/window_sdl.cpp               | 87 ++++++++++++++++++++++++++++
+ src/ui/windowed_app_context_sdl.cpp | 18 ++++++
+ 11 files changed, 286 insertions(+)
+
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 1f52480..6a64a13 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -218,6 +218,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   virtual void OnWindowMinimized() {}
+   virtual void OnWindowRestored() {}
+ 
++  /// Return true while an app overlay of its own (not one of the SDK's) needs
++  /// the controller and keyboard, so the guest sees an untouched pad instead.
++  /// Called from guest threads whenever they poll input - must be thread-safe.
++  virtual bool IsGuestInputBlocked() const { return false; }
++
+   /// Creates the overlay toggled by bind_achievements. Override to replace the
+   /// built-in achievement UI. Returning nullptr disables the overlay.
+   virtual std::unique_ptr<ui::ImGuiDialog> CreateAchievementsOverlay();
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index a570fa0..f06e904 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -72,6 +72,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   void OnMouseUp(MouseEvent& e) override;
+   void OnMouseWheel(MouseEvent& e) override;
+   void OnTouchEvent(TouchEvent& e) override;
++  void OnGamepadEvent(GamepadEvent& e) override;
+   // For now, no need for OnDpiChanged because redrawing is done continuously.
+ 
+  private:
+diff --git a/include/rex/ui/ui_event.h b/include/rex/ui/ui_event.h
+index 80dd79c..0004a0c 100644
+--- a/include/rex/ui/ui_event.h
++++ b/include/rex/ui/ui_event.h
+@@ -198,5 +198,72 @@ class TouchEvent : public UIEvent {
+   float y_;
+ };
+ 
++// A host gamepad button or axis change, for UI navigation. Not tied to any
++// window by the platform, so it is delivered to every window. Guest input
++// reads gamepads through the input drivers independently of these events.
++class GamepadEvent : public UIEvent {
++ public:
++  enum class Button {
++    kA,
++    kB,
++    kX,
++    kY,
++    kBack,
++    kGuide,
++    kStart,
++    kLeftThumb,
++    kRightThumb,
++    kLeftShoulder,
++    kRightShoulder,
++    kDpadUp,
++    kDpadDown,
++    kDpadLeft,
++    kDpadRight,
++  };
++  enum class Axis {
++    kLeftX,
++    kLeftY,
++    kRightX,
++    kRightY,
++    kLeftTrigger,
++    kRightTrigger,
++  };
++
++  static GamepadEvent MakeButton(Window* target, Button button, bool is_down) {
++    GamepadEvent e(target);
++    e.is_axis_ = false;
++    e.button_ = button;
++    e.is_down_ = is_down;
++    return e;
++  }
++  // Sticks are in [-1, 1] with positive Y pointing down, triggers in [0, 1].
++  static GamepadEvent MakeAxis(Window* target, Axis axis, float value) {
++    GamepadEvent e(target);
++    e.is_axis_ = true;
++    e.axis_ = axis;
++    e.value_ = value;
++    return e;
++  }
++
++  bool is_handled() const { return handled_; }
++  void set_handled(bool value) { handled_ = value; }
++
++  bool is_axis() const { return is_axis_; }
++  Button button() const { return button_; }
++  bool is_down() const { return is_down_; }
++  Axis axis() const { return axis_; }
++  float value() const { return value_; }
++
++ private:
++  explicit GamepadEvent(Window* target) : UIEvent(target) {}
++
++  bool handled_ = false;
++  bool is_axis_ = false;
++  Button button_ = Button::kA;
++  bool is_down_ = false;
++  Axis axis_ = Axis::kLeftX;
++  float value_ = 0.0f;
++};
++
+ }  // namespace ui
+ }  // namespace rex
+diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
+index f607be2..19d3075 100644
+--- a/include/rex/ui/window.h
++++ b/include/rex/ui/window.h
+@@ -618,6 +618,8 @@ class Window {
+ 
+   void OnTouchEvent(TouchEvent& e, WindowDestructionReceiver& destruction_receiver);
+ 
++  void OnGamepadEvent(GamepadEvent& e, WindowDestructionReceiver& destruction_receiver);
++
+  private:
+   struct ListenerIterationContext {
+     explicit ListenerIterationContext(ListenerIterationContext* outer_context,
+diff --git a/include/rex/ui/window_listener.h b/include/rex/ui/window_listener.h
+index e0bbffb..ca581c8 100644
+--- a/include/rex/ui/window_listener.h
++++ b/include/rex/ui/window_listener.h
+@@ -59,6 +59,7 @@ class WindowInputListener {
+   virtual void OnMouseWheel(MouseEvent&) {}
+ 
+   virtual void OnTouchEvent(TouchEvent&) {}
++  virtual void OnGamepadEvent(GamepadEvent&) {}
+ };
+ 
+ }  // namespace ui
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 71e7473..e9874cf 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -41,6 +41,7 @@ class WindowSDL final : public Window {
+   void HandleTextInputEvent(SDL_Event& event);
+   void HandleMouseEvent(SDL_Event& event);
+   void HandleDropEvent(SDL_Event& event);
++  void HandleGamepadEvent(SDL_Event& event);
+   void HandlePaintEvent();
+ 
+  protected:
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..21d13cf 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <cfloat>
++#include <cmath>
+ #include <cstring>
+ #include <filesystem>
+ #include <map>
+@@ -168,6 +169,11 @@ void ImGuiDrawer::Initialize() {
+   // Windows.
+   io.IniFilename = nullptr;
+ 
++  // Gamepad events come from the window (OnGamepadEvent) while a dialog is
++  // shown, so dialogs can be navigated without a keyboard or mouse.
++  io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
++  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
++
+   // Setup the font glyphs.
+   ImFontConfig font_config;
+   font_config.OversampleH = font_config.OversampleV = 1;
+@@ -615,6 +621,89 @@ void ImGuiDrawer::ClearInput() {
+   reset_mouse_position_after_next_frame_ = false;
+ }
+ 
++void ImGuiDrawer::OnGamepadEvent(GamepadEvent& e) {
++  auto& io = GetIO();
++  if (!e.is_axis()) {
++    ImGuiKey key;
++    switch (e.button()) {
++      case GamepadEvent::Button::kA:
++        key = ImGuiKey_GamepadFaceDown;
++        break;
++      case GamepadEvent::Button::kB:
++        key = ImGuiKey_GamepadFaceRight;
++        break;
++      case GamepadEvent::Button::kX:
++        key = ImGuiKey_GamepadFaceLeft;
++        break;
++      case GamepadEvent::Button::kY:
++        key = ImGuiKey_GamepadFaceUp;
++        break;
++      case GamepadEvent::Button::kBack:
++        key = ImGuiKey_GamepadBack;
++        break;
++      case GamepadEvent::Button::kStart:
++        key = ImGuiKey_GamepadStart;
++        break;
++      case GamepadEvent::Button::kLeftThumb:
++        key = ImGuiKey_GamepadL3;
++        break;
++      case GamepadEvent::Button::kRightThumb:
++        key = ImGuiKey_GamepadR3;
++        break;
++      case GamepadEvent::Button::kLeftShoulder:
++        key = ImGuiKey_GamepadL1;
++        break;
++      case GamepadEvent::Button::kRightShoulder:
++        key = ImGuiKey_GamepadR1;
++        break;
++      case GamepadEvent::Button::kDpadUp:
++        key = ImGuiKey_GamepadDpadUp;
++        break;
++      case GamepadEvent::Button::kDpadDown:
++        key = ImGuiKey_GamepadDpadDown;
++        break;
++      case GamepadEvent::Button::kDpadLeft:
++        key = ImGuiKey_GamepadDpadLeft;
++        break;
++      case GamepadEvent::Button::kDpadRight:
++        key = ImGuiKey_GamepadDpadRight;
++        break;
++      default:
++        return;
++    }
++    io.AddKeyEvent(key, e.is_down());
++    return;
++  }
++  // Same dead zone as the Dear ImGui example backends.
++  constexpr float kDeadZone = 0.25f;
++  auto analog = [&io](ImGuiKey negative, ImGuiKey positive, float value) {
++    float magnitude = std::abs(value);
++    float strength = magnitude > kDeadZone ? (magnitude - kDeadZone) / (1.0f - kDeadZone) : 0.0f;
++    io.AddKeyAnalogEvent(negative, value < 0.0f && strength > 0.0f, value < 0.0f ? strength : 0.0f);
++    io.AddKeyAnalogEvent(positive, value > 0.0f && strength > 0.0f, value > 0.0f ? strength : 0.0f);
++  };
++  switch (e.axis()) {
++    case GamepadEvent::Axis::kLeftX:
++      analog(ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight, e.value());
++      break;
++    case GamepadEvent::Axis::kLeftY:
++      analog(ImGuiKey_GamepadLStickUp, ImGuiKey_GamepadLStickDown, e.value());
++      break;
++    case GamepadEvent::Axis::kRightX:
++      analog(ImGuiKey_GamepadRStickLeft, ImGuiKey_GamepadRStickRight, e.value());
++      break;
++    case GamepadEvent::Axis::kRightY:
++      analog(ImGuiKey_GamepadRStickUp, ImGuiKey_GamepadRStickDown, e.value());
++      break;
++    case GamepadEvent::Axis::kLeftTrigger:
++      io.AddKeyAnalogEvent(ImGuiKey_GamepadL2, e.value() > 0.1f, e.value());
++      break;
++    case GamepadEvent::Axis::kRightTrigger:
++      io.AddKeyAnalogEvent(ImGuiKey_GamepadR2, e.value() > 0.1f, e.value());
++      break;
++  }
++}
++
+ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
+   auto& io = GetIO();
+   const VirtualKey virtual_key = e.virtual_key();
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..a277b2e 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -252,6 +252,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+     if (input_sys) {
+       input_sys->SetActiveCallback([this]() {
++        if (IsGuestInputBlocked()) {
++          return false;
++        }
+         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+           return true;
+         return !imgui_drawer_->GetIO().WantCaptureMouse;
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index b4e045f..8179ac2 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -731,6 +731,18 @@ void Window::OnTouchEvent(TouchEvent& e, WindowDestructionReceiver& destruction_
+   }
+ }
+ 
++void Window::OnGamepadEvent(GamepadEvent& e, WindowDestructionReceiver& destruction_receiver) {
++  PropagateEventThroughInputListeners(
++      [&e](auto listener) {
++        listener->OnGamepadEvent(e);
++        return e.is_handled();
++      },
++      destruction_receiver);
++  if (destruction_receiver.IsWindowDestroyed()) {
++    return;
++  }
++}
++
+ void Window::SendEventToListeners(std::function<void(WindowListener*)> fn,
+                                   WindowDestructionReceiver& destruction_receiver) {
+   if (!CanSendEventsToListeners()) {
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..edc05a9 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -508,6 +508,93 @@ void WindowSDL::HandleDropEvent(SDL_Event& event) {
+   OnFileDrop(e, destruction_receiver);
+ }
+ 
++void WindowSDL::HandleGamepadEvent(SDL_Event& event) {
++  WindowDestructionReceiver destruction_receiver(this);
++  if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
++    GamepadEvent::Axis axis;
++    switch (event.gaxis.axis) {
++      case SDL_GAMEPAD_AXIS_LEFTX:
++        axis = GamepadEvent::Axis::kLeftX;
++        break;
++      case SDL_GAMEPAD_AXIS_LEFTY:
++        axis = GamepadEvent::Axis::kLeftY;
++        break;
++      case SDL_GAMEPAD_AXIS_RIGHTX:
++        axis = GamepadEvent::Axis::kRightX;
++        break;
++      case SDL_GAMEPAD_AXIS_RIGHTY:
++        axis = GamepadEvent::Axis::kRightY;
++        break;
++      case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
++        axis = GamepadEvent::Axis::kLeftTrigger;
++        break;
++      case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:
++        axis = GamepadEvent::Axis::kRightTrigger;
++        break;
++      default:
++        return;
++    }
++    // Sticks are [-32768, 32767], triggers [0, 32767].
++    float value = std::clamp(float(event.gaxis.value) / 32767.0f, -1.0f, 1.0f);
++    GamepadEvent e = GamepadEvent::MakeAxis(this, axis, value);
++    OnGamepadEvent(e, destruction_receiver);
++    return;
++  }
++  GamepadEvent::Button button;
++  switch (event.gbutton.button) {
++    case SDL_GAMEPAD_BUTTON_SOUTH:
++      button = GamepadEvent::Button::kA;
++      break;
++    case SDL_GAMEPAD_BUTTON_EAST:
++      button = GamepadEvent::Button::kB;
++      break;
++    case SDL_GAMEPAD_BUTTON_WEST:
++      button = GamepadEvent::Button::kX;
++      break;
++    case SDL_GAMEPAD_BUTTON_NORTH:
++      button = GamepadEvent::Button::kY;
++      break;
++    case SDL_GAMEPAD_BUTTON_BACK:
++      button = GamepadEvent::Button::kBack;
++      break;
++    case SDL_GAMEPAD_BUTTON_GUIDE:
++      button = GamepadEvent::Button::kGuide;
++      break;
++    case SDL_GAMEPAD_BUTTON_START:
++      button = GamepadEvent::Button::kStart;
++      break;
++    case SDL_GAMEPAD_BUTTON_LEFT_STICK:
++      button = GamepadEvent::Button::kLeftThumb;
++      break;
++    case SDL_GAMEPAD_BUTTON_RIGHT_STICK:
++      button = GamepadEvent::Button::kRightThumb;
++      break;
++    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
++      button = GamepadEvent::Button::kLeftShoulder;
++      break;
++    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
++      button = GamepadEvent::Button::kRightShoulder;
++      break;
++    case SDL_GAMEPAD_BUTTON_DPAD_UP:
++      button = GamepadEvent::Button::kDpadUp;
++      break;
++    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
++      button = GamepadEvent::Button::kDpadDown;
++      break;
++    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
++      button = GamepadEvent::Button::kDpadLeft;
++      break;
++    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
++      button = GamepadEvent::Button::kDpadRight;
++      break;
++    default:
++      return;
++  }
++  GamepadEvent e =
++      GamepadEvent::MakeButton(this, button, event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
++  OnGamepadEvent(e, destruction_receiver);
++}
++
+ void WindowSDL::HandleKeyEvent(SDL_Event& event) {
+   VirtualKey virtual_key = TranslateSDLScancode(event.key.scancode);
+   if (virtual_key == VirtualKey::kNone) {
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..526ec70 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -169,6 +169,24 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+       }
+       break;
+     }
++    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
++    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
++    case SDL_EVENT_GAMEPAD_BUTTON_UP: {
++      // Gamepads aren't associated with a window - deliver to all of them,
++      // collecting the IDs first in case a listener closes a window.
++      std::vector<SDL_WindowID> window_ids;
++      window_ids.reserve(windows_.size());
++      for (const auto& [id, window] : windows_) {
++        (void)window;
++        window_ids.push_back(id);
++      }
++      for (SDL_WindowID id : window_ids) {
++        if (WindowSDL* window = GetWindow(id)) {
++          window->HandleGamepadEvent(event);
++        }
++      }
++      break;
++    }
+     case SDL_EVENT_DROP_FILE: {
+       if (WindowSDL* window = GetWindow(event.drop.windowID)) {
+         window->HandleDropEvent(event);
+-- 
+2.53.0.windows.2
+

@@ -1,0 +1,77 @@
+From 1a6f6869fb86d33c87d0d3938380e078f0a2eae9 Mon Sep 17 00:00:00 2001
+From: Daniel Robson <danny19901@gmail.com>
+Date: Sat, 24 Oct 2026 16:11:25 +0100
+Subject: [PATCH 4/4] feat(xam): let apps set the user profile identity
+
+UserProfile hard-coded the name "User", a fixed XUID and a signed-in
+state, with no way for an app to supply its own. Overriding the XamUser*
+import thunks through the function dispatcher does not help in a static
+recomp: generated code calls the imports directly, so only rare indirect
+calls are redirected and the guest keeps seeing "User".
+
+Add set_xuid, set_name and set_signin_state. Guest threads read the
+identity concurrently, so the XUID and sign-in state are atomics and the
+name is guarded by a mutex.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/system/xam/user_profile.h | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
+index ec37017..38e9955 100644
+--- a/include/rex/system/xam/user_profile.h
++++ b/include/rex/system/xam/user_profile.h
+@@ -11,7 +11,9 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -216,9 +218,24 @@ class UserProfile {
+ 
+   UserProfile();
+ 
+-  uint64_t xuid() const { return xuid_; }
+-  std::string name() const { return name_; }
+-  uint32_t signin_state() const { return 1; }
++  uint64_t xuid() const { return xuid_.load(std::memory_order_relaxed); }
++  std::string name() const {
++    std::lock_guard<std::mutex> lock(identity_mutex_);
++    return name_;
++  }
++  // 0 - signed out, 1 - signed in locally, 2 - signed in to Live.
++  uint32_t signin_state() const { return signin_state_.load(std::memory_order_relaxed); }
++
++  // The identity the guest sees. Apps can supply their own (a configured
++  // gamertag, for example); guest threads may be reading it concurrently.
++  void set_xuid(uint64_t xuid) { xuid_.store(xuid, std::memory_order_relaxed); }
++  void set_name(std::string name) {
++    std::lock_guard<std::mutex> lock(identity_mutex_);
++    name_ = std::move(name);
++  }
++  void set_signin_state(uint32_t state) {
++    signin_state_.store(state, std::memory_order_relaxed);
++  }
+   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+ 
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+@@ -227,8 +244,10 @@ class UserProfile {
+   Setting* GetSetting(uint32_t setting_id);
+ 
+  private:
+-  uint64_t xuid_;
++  std::atomic<uint64_t> xuid_;
++  mutable std::mutex identity_mutex_;
+   std::string name_;
++  std::atomic<uint32_t> signin_state_{1};
+   std::vector<std::unique_ptr<Setting>> setting_list_;
+   std::unordered_map<uint32_t, Setting*> settings_;
+   KernelState* kernel_state_ = nullptr;
+-- 
+2.53.0.windows.2
+

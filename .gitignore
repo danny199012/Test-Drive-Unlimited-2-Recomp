@@ -29,7 +29,7 @@ TDU2/
 rexglue/
 
 # SDK source tree (cloned for debugging; use the patch file instead)
-rexglue-sdk/
+/rexglue-sdk/
 
 # --- Debugging captures and binary dumps --------------------------------------
 # Real console RAM dumps (up to 480 MB each)
