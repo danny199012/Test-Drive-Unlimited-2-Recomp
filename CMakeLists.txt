@@ -13,6 +13,7 @@ include(generated/rexglue.cmake)
 # Sources
 set(TDU2_SOURCES
     src/main.cpp
+    src/tdu2_config.cpp
     src/tdu2_menu.cpp
     src/tdu2_profile.cpp
 )
