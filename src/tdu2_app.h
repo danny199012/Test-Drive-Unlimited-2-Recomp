@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
 
@@ -179,10 +181,9 @@ class Tdu2App : public rex::ReXApp {
     }
   }
 
-  // F1 toggles the curated quick-settings panel (render resolution, window
-  // size, fullscreen). F4, which the SDK registers by default, is the full cvar
-  // editor and covers everything this does plus far more - this is just the
-  // handful of things worth one keypress mid-game.
+  // F1 (or Back + Start on a controller, see OnGamepadEvent) toggles the
+  // curated settings menu. F4, which the SDK registers by default, is the full
+  // cvar editor and covers everything this does plus far more.
   void OnPostSetup() override {
     // The GPU plugin has loaded by now, so its cvars exist and their real
     // values can be read.
@@ -193,15 +194,40 @@ class Tdu2App : public rex::ReXApp {
     // modules have registered their function tables (OnPostLoadXexImage) but
     // before the guest starts calling them, so it is installed from
     // OnPreLaunchModule below.
-    rex::ui::RegisterBind(
-        "bind_tdu2_menu", "F1", "Toggle TDU2 quick settings menu",
-        [this] {
-          if (tdu2_menu_) {
-            tdu2_menu_.reset();
-          } else if (imgui_drawer()) {
-            tdu2_menu_ = std::make_unique<Tdu2MenuDialog>(imgui_drawer());
-          }
-        });
+    if (runtime() != nullptr && runtime()->kernel_state() != nullptr) {
+      tdu2::BindProfileToRuntime(runtime()->kernel_state()->user_profile());
+    }
+
+    Tdu2MenuDialog::CaptureStartupValues();
+    rex::ui::RegisterBind("bind_tdu2_menu", "F1", "Toggle TDU2 settings menu",
+                          [this] { ToggleMenu(); });
+  }
+
+  // Back + Start opens or closes the menu from a controller. Back and Start
+  // still reach the game on the way in (Start pauses it, which suits a
+  // settings screen); once the menu is open, IsGuestInputBlocked keeps the
+  // game from seeing anything until it closes.
+  void OnGamepadEvent(rex::ui::GamepadEvent& e) override {
+    if (e.is_axis()) {
+      return;
+    }
+    switch (e.button()) {
+      case rex::ui::GamepadEvent::Button::kBack:
+        pad_back_down_ = e.is_down();
+        break;
+      case rex::ui::GamepadEvent::Button::kStart:
+        pad_start_down_ = e.is_down();
+        break;
+      default:
+        return;
+    }
+    if (e.is_down() && pad_back_down_ && pad_start_down_) {
+      ToggleMenu();
+    }
+  }
+
+  bool IsGuestInputBlocked() const override {
+    return menu_open_.load(std::memory_order_relaxed);
   }
 
   // Installs the synthetic-profile overrides over the guest's XamUser* imports.
@@ -223,6 +249,7 @@ class Tdu2App : public rex::ReXApp {
   void OnShutdown() override {
     rex::ui::UnregisterBind("bind_tdu2_menu");
     tdu2_menu_.reset();
+    menu_open_ = false;
 
     if (profile_hook_thread_.joinable()) {
       profile_hook_thread_.join();
@@ -241,8 +268,28 @@ class Tdu2App : public rex::ReXApp {
   // CreateAchievementNotificationDialog() override;
 
  private:
+  // UI thread only.
+  void ToggleMenu() {
+    if (tdu2_menu_) {
+      tdu2_menu_.reset();
+      menu_open_ = false;
+    } else if (imgui_drawer()) {
+      // A menu that closes itself deletes itself right after on_close, so the
+      // pointer is released rather than reset.
+      tdu2_menu_ = std::make_unique<Tdu2MenuDialog>(imgui_drawer(), [this] {
+        (void)tdu2_menu_.release();
+        menu_open_ = false;
+      });
+      menu_open_ = true;
+    }
+  }
+
   // Held by the app; the ImGui drawer draws it every frame.
   std::unique_ptr<Tdu2MenuDialog> tdu2_menu_;
+  // Mirrors tdu2_menu_ for IsGuestInputBlocked, which guest threads call.
+  std::atomic<bool> menu_open_{false};
+  bool pad_back_down_ = false;
+  bool pad_start_down_ = false;
 
   // Installs the profile import overrides once the game DLL has registered.
   std::thread profile_hook_thread_;

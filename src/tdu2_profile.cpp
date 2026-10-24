@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -13,6 +11,9 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/xam/user_profile.h>
+
+#include "tdu2_config.h"
 
 namespace tdu2 {
 namespace {
@@ -197,106 +198,36 @@ Profile GetProfile() {
   return profile;
 }
 
-namespace {
-
-// Replaces the value of a flat `key = ...` line, preserving everything else in
-// the file including comments and spacing around the `=`. Returns false when
-// the key was not present.
-//
-// The separator is matched with optional surrounding whitespace: a hand-written
-// config normally reads `key = value`, while this function used to write
-// `key=value`. Matching the bare `key=` prefix silently missed the former and
-// appended a duplicate key instead of replacing it.
-bool ReplaceTomlValue(std::vector<std::string>& lines, const std::string& key,
-                      const std::string& value, bool quoted) {
-  for (auto& line : lines) {
-    if (line.rfind(key, 0) != 0) {
-      continue;
-    }
-    size_t pos = key.size();
-    while (pos < line.size() &&
-           (line[pos] == ' ' || line[pos] == '\t')) {
-      ++pos;
-    }
-    if (pos >= line.size() || line[pos] != '=') {
-      continue;  // a different key that merely starts with the same text
-    }
-    line = key + " = " + (quoted ? "\"" + value + "\"" : value);
-    return true;
+void BindProfileToRuntime(rex::system::xam::UserProfile* user_profile) {
+  if (user_profile == nullptr) {
+    REXLOG_WARN("No runtime user profile; the guest keeps the default identity");
+    return;
   }
-  return false;
+  auto apply = [user_profile] {
+    const Profile profile = GetProfile();
+    user_profile->set_name(profile.name);
+    user_profile->set_xuid(profile.xuid);
+    user_profile->set_signin_state(profile.signed_in ? 1 : 0);
+  };
+  apply();
+  for (const char* cvar : {"profile_name", "profile_xuid", "profile_signed_in"}) {
+    rex::cvar::RegisterChangeCallback(cvar,
+                                      [apply](std::string_view, std::string_view) { apply(); });
+  }
+  const Profile profile = GetProfile();
+  REXLOG_INFO("Runtime user profile set to {} (xuid={}, signed_in={})", profile.name,
+              profile.xuid, profile.signed_in);
 }
 
-}  // namespace
-
 bool SaveProfileToConfig() {
-  namespace fs = std::filesystem;
-  std::error_code ec;
-
-  // The runtime reads tdu2.toml from next to the exe, so that is the file that
-  // has to change for the edit to survive a restart.
-  const fs::path config = fs::current_path(ec) / "tdu2.toml";
-  if (ec) {
-    REXLOG_WARN("Could not resolve current directory: {}", ec.message());
-    return false;
-  }
-  if (!fs::exists(config, ec)) {
-    REXLOG_WARN("No tdu2.toml next to the exe; profile not saved");
-    return false;
-  }
-
-  std::ifstream in(config, std::ios::binary);
-  if (!in) {
-    REXLOG_WARN("Could not open tdu2.toml for reading");
-    return false;
-  }
-
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(in, line)) {
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();  // avoid accumulating CR in CRLF files
-    }
-    lines.push_back(line);
-  }
-
   const Profile profile = GetProfile();
-  const std::string xuid_text = std::to_string(profile.xuid);
-  const std::string signed_text = profile.signed_in ? "true" : "false";
-
-  // Append any key that was missing, so the profile always round-trips even
-  // against a config written before these settings existed.
-  struct KeyValue {
-    const char* key;
-    const std::string value;
-    bool quoted;
-  };
-  const KeyValue keys[] = {
-      {"profile_name", profile.name, true},
-      {"profile_xuid", xuid_text, false},
-      {"profile_signed_in", signed_text, false},
-  };
-  for (const auto& kv : keys) {
-    if (!ReplaceTomlValue(lines, kv.key, kv.value, kv.quoted)) {
-      lines.push_back(std::string(kv.key) + "=" +
-                      (kv.quoted ? "\"" + kv.value + "\"" : kv.value));
-    }
-  }
-
-  std::ofstream out(config, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    REXLOG_WARN("Could not open tdu2.toml for writing");
+  if (!SaveConfigValues({
+          {"profile_name", profile.name, true},
+          {"profile_xuid", std::to_string(profile.xuid), false},
+          {"profile_signed_in", profile.signed_in ? "true" : "false", false},
+      })) {
     return false;
   }
-  for (const auto& l : lines) {
-    out << l << "\n";
-  }
-  out.close();
-  if (!out) {
-    REXLOG_WARN("Failed while writing tdu2.toml");
-    return false;
-  }
-
   REXLOG_INFO("Saved profile to tdu2.toml (name={}, xuid={})", profile.name,
               profile.xuid);
   return true;

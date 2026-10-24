@@ -18,6 +18,10 @@
 #include <cstdint>
 #include <string>
 
+namespace rex::system::xam {
+class UserProfile;
+}  // namespace rex::system::xam
+
 namespace tdu2 {
 
 // Guest-visible profile identity. Defaults match config/tdu2.toml.template.
@@ -37,6 +41,16 @@ Profile GetProfile();
 // Writes the current profile back to tdu2.toml next to the exe, so edits made
 // in the F1 menu survive a restart. Returns false if the file is not writable.
 bool SaveProfileToConfig();
+
+// Copies the profile into the runtime's own user profile and keeps it in sync
+// when the profile cvars change (from the F1 menu, say).
+//
+// This is what the guest actually sees: the recompiled code calls the XamUser*
+// imports directly (`b 0x88fe7394` becomes a C++ call), so the dispatcher
+// overrides below only catch the rare indirect calls, and the runtime's
+// built-in "User" profile answered everything else. Call from OnPostSetup,
+// before the guest starts.
+void BindProfileToRuntime(rex::system::xam::UserProfile* user_profile);
 
 // Guest addresses of the profile-related import thunks in each module, as
 // emitted by codegen. Overriding these is how the guest's identity queries are

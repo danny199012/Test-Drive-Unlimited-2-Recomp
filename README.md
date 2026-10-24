@@ -62,6 +62,29 @@ there is no graphics emulation at all).
 First codegen of the 16 MB DLL takes a few minutes; the stamp file makes
 later builds incremental.
 
+### ReXGlue SDK patches
+
+The `-perf` build compiles the SDK from source in `rexglue-sdk/` (not tracked
+here). This project needs four SDK changes on top of
+[rexglue-sdk](https://github.com/rexglue/rexglue-sdk) v0.10.0 (`c94f5eb`),
+kept in `patches/rexglue-sdk/`:
+
+| Patch | What it fixes |
+|---|---|
+| `0001` present on a dedicated queue | Below 1 FPS whenever the window was focused (presentation stalled the GPU emulation queue) |
+| `0002` snap point-sampled fetches | Stretched / deformed bodies in the pool party and character select (wrong bone matrix rows) |
+| `0003` gamepad navigation for ImGui | Controller support in the F1 menu and the other overlays; blocks game input while the menu is open |
+| `0004` user profile identity | The game showing "User" instead of `profile_name` |
+
+```
+git clone https://github.com/rexglue/rexglue-sdk rexglue-sdk
+git -C rexglue-sdk checkout -b tdu2 c94f5eb
+git -C rexglue-sdk am ../patches/rexglue-sdk/*.patch
+```
+
+The app sources (`src/tdu2_app.h`, `src/tdu2_menu.cpp`) use the APIs added by
+`0003` and `0004`, so they do not build against an unpatched SDK.
+
 ## Running
 
 The game content must be pointed at explicitly:

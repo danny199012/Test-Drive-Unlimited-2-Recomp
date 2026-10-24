@@ -1,0 +1,96 @@
+From d31d69b23fd68527b18db606e966e6f33bd22602 Mon Sep 17 00:00:00 2001
+From: Daniel Robson <danny19901@gmail.com>
+Date: Sat, 24 Oct 2026 15:15:45 +0100
+Subject: [PATCH 2/4] fix(shader): snap point-sampled unnormalized fetches to
+ the texel center
+
+Unnormalized texture coordinates are normalized with a division that is
+not exact (DXBC div allows 2.5 ULP; the SPIR-V path has the same issue).
+On wide textures the error reaches the 1.5/1024 texel rounding offset, so
+a point-sampled fetch at an integer coordinate can land on the previous
+texel.
+
+Test Drive Unlimited 2 (49470804) skins characters in the vertex shader
+with bone matrices stored in a 4224x3 32_32_32_32_FLOAT texture, indexed
+by palette base + bone number with tfetch2D UnnormalizedTextureCoords and
+point filtering. Palette bases near the end of the texture (3712-3968)
+fetched rows of the neighbouring bone, stretching trousers and skirts
+across the screen in the pool party and character select scenes. The same
+artifact exists in upstream Xenia.
+
+When the fetch has explicit point mag/min filters, a fixed base level (no
+computed or register LOD, no LOD bias), no resolution-scaled offset and
+is not a cube map, floor the offset coordinate and add 0.5 before
+normalizing. That is the texel point sampling selects anyway, now with a
+half-texel margin against the division error.
+
+The DXBC change was verified in the game; the SPIR-V change was only
+compile-checked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pipeline/shader/dxbc_translator_fetch.cpp | 20 +++++++++++++++++++
+ .../shader/spirv_translator_fetch.cpp         | 16 +++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index 31de175..7806da3 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -1059,6 +1059,26 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+           a_.OpMov(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_without_offsets),
+                    coord_operand);
+         }
++        // With explicit point filtering at the base level, the texel is known
++        // here already - snap to its center before normalizing. The division
++        // below is not exact (up to 2.5 ULP), and on wide textures its error
++        // reaches the rounding offset, so the previous texel may be sampled.
++        // 4224x3 bone matrix textures indexed by the bone number in 49470804
++        // vertex shaders lost a matrix row to that, deforming characters.
++        uint32_t point_snapped_components = normalized_components_with_unscaled_offsets & 0b011;
++        if (instr.dimension == xenos::FetchOpDimension::kCube ||
++            instr.attributes.mag_filter != xenos::TextureFilter::kPoint ||
++            instr.attributes.min_filter != xenos::TextureFilter::kPoint ||
++            instr.attributes.use_computed_lod || instr.attributes.use_register_lod ||
++            instr.attributes.lod_bias != 0.0f) {
++          point_snapped_components = 0;
++        }
++        if (point_snapped_components) {
++          a_.OpRoundNI(dxbc::Dest::R(coord_and_sampler_temp, point_snapped_components),
++                       dxbc::Src::R(coord_and_sampler_temp));
++          a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, point_snapped_components),
++                   dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::LF(0.5f));
++        }
+         assert_not_zero(normalized_components & 0b011);
+         a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, normalized_components & 0b011),
+                  dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(size_and_is_3d_temp));
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..05dea8a 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -1080,6 +1080,22 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+           if (component_offset != spv::NoResult) {
+             coordinate_ref = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_,
+                                                                 coordinate_ref, component_offset);
++            // With explicit point filtering at the base level, snap to the
++            // texel center before the inexact division, see the DXBC
++            // translator for details.
++            if (instr.opcode == ucode::FetchOpcode::kTextureFetch &&
++                instr.dimension != xenos::FetchOpDimension::kCube &&
++                !(revert_resolution_scale_axes & (UINT32_C(1) << i)) &&
++                instr.attributes.mag_filter == xenos::TextureFilter::kPoint &&
++                instr.attributes.min_filter == xenos::TextureFilter::kPoint &&
++                !instr.attributes.use_computed_lod && !instr.attributes.use_register_lod &&
++                instr.attributes.lod_bias == 0.0f) {
++              coordinate_ref = builder_->createNoContractionBinOp(
++                  spv::OpFAdd, type_float_,
++                  builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
++                                                   GLSLstd450Floor, coordinate_ref),
++                  builder_->makeFloatConstant(0.5f));
++            }
+           }
+           assert_true(size_component != spv::NoResult);
+           coordinate_ref = builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
+-- 
+2.53.0.windows.2
+

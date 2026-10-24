@@ -17,3 +17,6 @@ build.cmd text eol=crlf
 # Never rewrite these as text.
 *.png binary
 *.jpg binary
+
+# git format-patch files must keep LF line endings for git am.
+*.patch -text
