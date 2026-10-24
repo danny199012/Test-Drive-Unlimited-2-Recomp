@@ -11,6 +11,7 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/xam/user_profile.h>
 
 #include "tdu2_config.h"
 
@@ -195,6 +196,27 @@ Profile GetProfile() {
   profile.xuid = REXCVAR_GET(profile_xuid);
   profile.signed_in = REXCVAR_GET(profile_signed_in);
   return profile;
+}
+
+void BindProfileToRuntime(rex::system::xam::UserProfile* user_profile) {
+  if (user_profile == nullptr) {
+    REXLOG_WARN("No runtime user profile; the guest keeps the default identity");
+    return;
+  }
+  auto apply = [user_profile] {
+    const Profile profile = GetProfile();
+    user_profile->set_name(profile.name);
+    user_profile->set_xuid(profile.xuid);
+    user_profile->set_signin_state(profile.signed_in ? 1 : 0);
+  };
+  apply();
+  for (const char* cvar : {"profile_name", "profile_xuid", "profile_signed_in"}) {
+    rex::cvar::RegisterChangeCallback(cvar,
+                                      [apply](std::string_view, std::string_view) { apply(); });
+  }
+  const Profile profile = GetProfile();
+  REXLOG_INFO("Runtime user profile set to {} (xuid={}, signed_in={})", profile.name,
+              profile.xuid, profile.signed_in);
 }
 
 bool SaveProfileToConfig() {

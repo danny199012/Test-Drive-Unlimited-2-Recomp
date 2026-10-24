@@ -16,6 +16,7 @@
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
 
@@ -193,6 +194,10 @@ class Tdu2App : public rex::ReXApp {
     // modules have registered their function tables (OnPostLoadXexImage) but
     // before the guest starts calling them, so it is installed from
     // OnPreLaunchModule below.
+    if (runtime() != nullptr && runtime()->kernel_state() != nullptr) {
+      tdu2::BindProfileToRuntime(runtime()->kernel_state()->user_profile());
+    }
+
     Tdu2MenuDialog::CaptureStartupValues();
     rex::ui::RegisterBind("bind_tdu2_menu", "F1", "Toggle TDU2 settings menu",
                           [this] { ToggleMenu(); });
