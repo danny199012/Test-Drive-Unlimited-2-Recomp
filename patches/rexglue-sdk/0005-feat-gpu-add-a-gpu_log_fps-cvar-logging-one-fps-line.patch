@@ -1,0 +1,59 @@
+From b72210927ebc489aa3cd2eb01a75e9f0b6e593d6 Mon Sep 17 00:00:00 2001
+From: Daniel Robson <danny19901@gmail.com>
+Date: Sat, 24 Oct 2026 18:18:16 +0100
+Subject: [PATCH] feat(gpu): add a gpu_log_fps cvar logging one fps line per
+ second
+
+IssueSwap fires once per guest vsync swap, so a per-second counter over it
+gives the true presented framerate even when the host runs far ahead. Off by
+default; the unattended perf-test tooling in the TDU2 project uses it as a
+fallback when the per-frame CSV logger is not enabled.
+---
+ src/graphics/d3d12/command_processor.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..3472e7d 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -47,6 +48,10 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_log_fps, false, "GPU",
++                    "Log one '[perf] fps=...' line per second (guest swaps per second)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -1894,6 +1899,18 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  if (REXCVAR_GET(gpu_log_fps)) {
++    static auto perf_window_start = std::chrono::steady_clock::now();
++    static uint32_t perf_frames = 0;
++    ++perf_frames;
++    const auto perf_now = std::chrono::steady_clock::now();
++    const double perf_seconds = std::chrono::duration<double>(perf_now - perf_window_start).count();
++    if (perf_seconds >= 1.0) {
++      REXGPU_INFO("[perf] fps={:.1f}", perf_frames / perf_seconds);
++      perf_frames = 0;
++      perf_window_start = perf_now;
++    }
++  }
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+-- 
+2.53.0.windows.2
+

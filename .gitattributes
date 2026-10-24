@@ -1,10 +1,12 @@
 # Normalise text in the repository; check out platform-native endings.
 #
-# build.cmd is the exception: it is a Windows batch file, and cmd.exe misparses
-# LF-only line endings (labels and `goto` silently break). Force CRLF for it
-# regardless of platform so the script always runs on Windows.
+# Batch files are the exception: cmd.exe misparses LF-only line endings
+# (labels and `goto` silently break). Force CRLF for them regardless of
+# platform so they always run on Windows.
 * text=auto
-build.cmd text eol=crlf
+build.cmd      text eol=crlf
+play.bat       text eol=crlf
+perf_test.bat  text eol=crlf
 
 *.cpp text
 *.h   text
