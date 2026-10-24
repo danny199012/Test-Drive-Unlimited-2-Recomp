@@ -79,7 +79,24 @@ goto parse_args
 :args_done
 if "%TARGET%"=="" set "TARGET=tdu2_codegen"
 
-cmake --preset %CONFIG% -DCMAKE_PREFIX_PATH="%REXSDK%" -DREXGLUE_SDK_ROOT="%REXSDK%" || exit /b 1
+rem The app sources use APIs added by the SDK changes shipped in
+rem patches\rexglue-sdk\ (README, "ReXGlue SDK patches"), so the game target
+rem must be configured against a PATCHED SDK source tree, not the prebuilt
+rem v0.10.0 headers. When rexglue-sdk\ has been cloned and patched next to
+rem this script, point CMake at it; otherwise warn that the build will fail.
+set "REXSDK_SOURCE_ARG="
+if exist "%~dp0rexglue-sdk\CMakeLists.txt" goto have_sdk_source
+if "%TARGET%"=="tdu2" (
+    echo [build.cmd] Note: no rexglue-sdk\ source tree found - configuring 1>&2
+    echo [build.cmd] against the prebuilt v0.10.0 SDK, which lacks the APIs 1>&2
+    echo [build.cmd] the app uses. See README, "ReXGlue SDK patches".        1>&2
+)
+goto sdk_source_done
+:have_sdk_source
+set "REXSDK_SOURCE_ARG=-DREXSDK_DIR="%~dp0rexglue-sdk""
+:sdk_source_done
+
+cmake --preset %CONFIG% -DCMAKE_PREFIX_PATH="%REXSDK%" -DREXGLUE_SDK_ROOT="%REXSDK%" %REXSDK_SOURCE_ARG% || exit /b 1
 cmake --build out\build\%CONFIG% --target %TARGET%
 exit /b %ERRORLEVEL%
 

@@ -65,9 +65,9 @@ later builds incremental.
 ### ReXGlue SDK patches
 
 The `-perf` build compiles the SDK from source in `rexglue-sdk/` (not tracked
-here). This project needs four SDK changes on top of
+here). This project needs the SDK changes below on top of
 [rexglue-sdk](https://github.com/rexglue/rexglue-sdk) v0.10.0 (`c94f5eb`),
-kept in `patches/rexglue-sdk/`:
+kept in `patches/rexglue-sdk/` (0001–0004 required, 0005 optional):
 
 | Patch | What it fixes |
 |---|---|
@@ -75,6 +75,7 @@ kept in `patches/rexglue-sdk/`:
 | `0002` snap point-sampled fetches | Stretched / deformed bodies in the pool party and character select (wrong bone matrix rows) |
 | `0003` gamepad navigation for ImGui | Controller support in the F1 menu and the other overlays; blocks game input while the menu is open |
 | `0004` user profile identity | The game showing "User" instead of `profile_name` |
+| `0005` gpu fps logging | Optional `gpu_log_fps` cvar: one `[perf] fps=` line per second, the fallback source `perf_test.bat` summarises |
 
 ```
 git clone https://github.com/rexglue/rexglue-sdk rexglue-sdk
@@ -85,7 +86,16 @@ git -C rexglue-sdk am ../patches/rexglue-sdk/*.patch
 The app sources (`src/tdu2_app.h`, `src/tdu2_menu.cpp`) use the APIs added by
 `0003` and `0004`, so they do not build against an unpatched SDK.
 
+Once the patched `rexglue-sdk\` tree exists next to `build.cmd`, the script
+passes `-DREXSDK_DIR` automatically, so `build.cmd -perf tdu2` (and every
+other config) builds against it instead of the prebuilt headers. Without the
+tree, `build.cmd tdu2` warns that the build cannot succeed.
+
 ## Running
+
+`play.bat` wraps the run command: it picks the build (`play.bat` for `-perf`,
+`-release`, `-debug`), always supplies `--game_data_root` and
+`--gpu_plugin xenos`, and forwards any extra arguments to the exe.
 
 The game content must be pointed at explicitly:
 
